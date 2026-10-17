@@ -30,6 +30,22 @@ import (
 // middleware rather than by calling a handler directly.
 func docsServer(t *testing.T, enabled bool) http.Handler {
 	t.Helper()
+	return newDocsRigWith(t, enabled).handler
+}
+
+// docsTestRig is a built server plus the store behind it, so a test can assert
+// on what was written rather than only on what was returned.
+type docsTestRig struct {
+	handler http.Handler
+	store   *memstore.Store
+}
+
+func (r *docsTestRig) serviceStore() *memstore.Store { return r.store }
+
+func newDocsRig(t *testing.T) *docsTestRig { return newDocsRigWith(t, true) }
+
+func newDocsRigWith(t *testing.T, enabled bool) *docsTestRig {
+	t.Helper()
 
 	cfg := testConfig(string(testKey))
 	cfg.APIDocsEnabled = enabled
@@ -46,7 +62,7 @@ func docsServer(t *testing.T, enabled bool) http.Handler {
 		logs:  &bytes.Buffer{},
 		cfg:   cfg,
 	}
-	return rig.build(t, logger, nil)
+	return &docsTestRig{handler: rig.build(t, logger, nil), store: store}
 }
 
 // request builds a request carrying one header, for the conditional-GET checks.
@@ -96,6 +112,80 @@ func TestDocsUILoadsTheLocalSpecification(t *testing.T) {
 	if strings.Contains(body, "http://127.0.0.1:8080/assets") ||
 		strings.Contains(body, "http://localhost:8080/assets") {
 		t.Error("the page hard-codes an absolute asset URL, which breaks behind a proxy")
+	}
+}
+
+// The page must state which Swagger UI release is vendored into the binary.
+//
+// It is the first question asked when a documentation page misbehaves, and an
+// operator who cannot answer it from the page has nowhere else to look. The
+// assertion is on the served page rather than on Version() alone, because the
+// page is where the answer is needed — a version computed and then not rendered
+// is worth nothing to the reader.
+func TestDocsPageStatesTheVendoredVersion(t *testing.T) {
+	t.Parallel()
+
+	version := docs.Version()
+
+	// A release is recorded, not guessed at. "unknown" would be a version the
+	// page prints while telling the operator nothing.
+	if version == "" || version == "unknown" {
+		t.Fatalf("the vendored Swagger UI version is %q; assets/VERSION must record the pinned release", version)
+	}
+	// Dotted numeric, so a stray path, a git hash or a copy-pasted URL cannot
+	// be committed in its place and still satisfy this.
+	for _, part := range strings.Split(version, ".") {
+		if part == "" {
+			t.Fatalf("the vendored version %q is not a dotted release number", version)
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				t.Fatalf("the vendored version %q is not a dotted release number", version)
+			}
+		}
+	}
+
+	body := do(t, docsServer(t, true), http.MethodGet, "/docs/", "", "").Body.String()
+	if !strings.Contains(body, "Swagger UI "+version+" is vendored") {
+		t.Errorf("the page does not state the vendored release %q", version)
+	}
+}
+
+// The page supports conditional requests too, and the contract documents that it
+// does.
+//
+// It is rendered once per binary, so the tag is stable for the life of a
+// deployment: a client's cached copy survives a restart, and only a rebuild that
+// changes the page produces a new tag.
+func TestDocsUISupportsConditionalRequests(t *testing.T) {
+	t.Parallel()
+
+	h := docsServer(t, true)
+
+	first := do(t, h, http.MethodGet, "/docs/", "", "")
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag on the documentation page")
+	}
+	// A strong tag: the bytes are byte-identical, so there is no reason to
+	// weaken it, and a weak tag would stop a shared cache reusing the copy.
+	if strings.HasPrefix(etag, "W/") {
+		t.Errorf("ETag = %q is weak; the representation is byte-identical", etag)
+	}
+
+	second := httptest.NewRecorder()
+	h.ServeHTTP(second, request(http.MethodGet, "/docs/", "If-None-Match", etag))
+	if second.Code != http.StatusNotModified {
+		t.Errorf("a matching If-None-Match returned %d, want 304", second.Code)
+	}
+	if second.Body.Len() != 0 {
+		t.Errorf("a 304 carried %d bytes of body", second.Body.Len())
+	}
+
+	// The tag must track the content rather than the process: the same binary
+	// answering twice produces the same tag, or nothing would ever be cacheable.
+	if again := do(t, h, http.MethodGet, "/docs/", "", "").Header().Get("ETag"); again != etag {
+		t.Errorf("the page ETag changed between requests: %q then %q", etag, again)
 	}
 }
 
@@ -310,9 +400,27 @@ func TestDocsDiscloseNoCredentials(t *testing.T) {
 	}
 }
 
+// The three tests below call config.Load directly to check one boolean, but Load
+// validates every variable it reads. An ambient URL_ENCRYPTION_KEY that is not
+// hex — a developer's shell, a CI job, an exported shell variable — fails the
+// load, and the test then reports a documentation failure that has nothing to do
+// with documentation. Clearing it keeps the assertion about API_DOCS_ENABLED.
+//
+// This is deliberately the one variable rather than all forty-one, because it is
+// the only one whose validation rule is not inferable from its type: an opaque
+// string is accepted wherever it appears, so only this one turns a stray export
+// into a failure.
+//
+// t.Setenv forbids t.Parallel, so these tests stay serial.
+func isolateConfigEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("URL_ENCRYPTION_KEY", "")
+}
+
 // The default must be "on", so local development does not have to opt in and
 // documentation cannot rot by being switched off and forgotten.
 func TestAPIDocsDefaultEnabled(t *testing.T) {
+	isolateConfigEnv(t)
 	t.Setenv("API_DOCS_ENABLED", "")
 
 	cfg, err := config.Load()
@@ -327,6 +435,7 @@ func TestAPIDocsDefaultEnabled(t *testing.T) {
 func TestAPIDocsCanBeDisabled(t *testing.T) {
 	for _, spelling := range []string{"false", "0", "no", "off", "FALSE"} {
 		t.Run(spelling, func(t *testing.T) {
+			isolateConfigEnv(t)
 			t.Setenv("API_DOCS_ENABLED", spelling)
 
 			cfg, err := config.Load()
@@ -343,6 +452,7 @@ func TestAPIDocsCanBeDisabled(t *testing.T) {
 func TestAPIDocsCanBeEnabledExplicitly(t *testing.T) {
 	for _, spelling := range []string{"true", "1", "yes", "on"} {
 		t.Run(spelling, func(t *testing.T) {
+			isolateConfigEnv(t)
 			t.Setenv("API_DOCS_ENABLED", spelling)
 
 			cfg, err := config.Load()

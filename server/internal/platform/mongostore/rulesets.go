@@ -53,7 +53,17 @@ type Rule struct {
 
 // RuleAction is what a rule does on a match.
 type RuleAction struct {
-	Type string `bson:"type" json:"type"`
+	Type     string    `bson:"type"              json:"type"`
+	Redirect *Redirect `bson:"redirect,omitempty" json:"redirect,omitempty"`
+}
+
+// Redirect is the persisted redirect target of a redirect rule.
+//
+// Only extension_path is modelled. Chrome also permits `url` and `transform`;
+// neither is emitted by this engine, and modelling them would make it possible
+// to persist a redirect that leaves the extension.
+type Redirect struct {
+	ExtensionPath string `bson:"extension_path" json:"extensionPath"`
 }
 
 // RuleCondition is what a rule matches.
@@ -79,6 +89,7 @@ type RuleProvenance struct {
 	RegistrableDomain string `bson:"registrable_domain,omitempty"`
 	Corroboration     int    `bson:"corroboration"`
 	Scope             string `bson:"scope"`
+	Action            string `bson:"action"`
 }
 
 // Ruleset is one immutable published snapshot.

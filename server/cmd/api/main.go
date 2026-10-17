@@ -1,12 +1,28 @@
-// Command api serves the CyberGuard JSON API.
+// Command api serves the CyberGuard JSON API and runs the scan pipeline.
 //
-// It validates configuration at startup, opens the MongoDB and Redis
-// connections, exposes liveness and readiness probes, and shuts down
-// gracefully so in-flight requests finish before the container exits.
+// It validates configuration at startup, opens the MongoDB connection, exposes
+// liveness and readiness probes, and shuts down gracefully so in-flight requests
+// finish before the container exits.
 //
-// The API accepts submissions and reads status. It never contacts the analysis
-// provider: all provider work happens in the worker, so a slow detonation can
-// never hold an HTTP request open.
+// # The scan runner lives here
+//
+// This process used to be paired with a separate worker binary talking to a Redis
+// queue. Both are gone. The API starts the scan runner as background goroutines
+// and the scans collection is the queue, so the deployment is one application
+// process plus one datastore.
+//
+// What that changes, stated plainly:
+//
+//   - A slow detonation still never holds an HTTP request open. Analysis runs on
+//     its own goroutines, and POST /api/v1/check-url still returns 202
+//     immediately. The decoupling that mattered was between the request and the
+//     analysis, not between two processes.
+//   - Horizontal scaling no longer needs anything coordinated: the claim is an
+//     atomic lease on a document, so several replicas compete safely for work.
+//     It does need the caveat in the rate-limit package: counters are
+//     per-process, so the configured limits are per-replica.
+//   - Restarting the API stops analysis for as long as the restart takes. There
+//     is no second process to keep draining the queue.
 package main
 
 import (
@@ -26,6 +42,7 @@ import (
 	"cyberguard/server/internal/httpapi"
 	"cyberguard/server/internal/logging"
 	"cyberguard/server/internal/ratelimit"
+	"cyberguard/server/internal/rulesetapi"
 )
 
 // Overridden at build time via -ldflags "-X main.version=...".
@@ -83,25 +100,45 @@ func run() error {
 
 	logger.Info("analysis provider selected", slog.String("provider", cfg.AnalysisProvider))
 
-	// The API builds the provider but never calls it. It is constructed so both
-	// processes agree on configuration and so provider-scoped settings are
-	// validated identically; no request from this process reaches a provider.
 	provider, err := app.NewProvider(cfg, logger)
 	if err != nil {
 		return fmt.Errorf("analysis provider: %w", err)
 	}
+	app.ReportProviderState(ctx, cfg, provider, logger)
 
-	limiter := ratelimit.New(datastores.Redis.Redis(), time.Now)
+	// Counters are in-process. See the ratelimit package for what per-process
+	// scope means and when it stops being acceptable.
+	limiter := ratelimit.New(time.Now)
 
-	scanService, err := app.NewScanService(cfg, datastores.Mongo, datastores.Redis, provider, logger,
+	scanService, err := app.NewScanService(cfg, datastores.Mongo, provider, logger,
 		httpapi.NewFingerprintGuard(limiter, cfg))
 	if err != nil {
 		return fmt.Errorf("scan service: %w", err)
 	}
 
+	// The scan runner starts before the listener so a scan accepted immediately
+	// after boot is picked up, rather than waiting out a reconcile interval.
+	runnerCtx, stopRunner := context.WithCancel(ctx)
+	runnerDone := make(chan struct{})
+	go func() {
+		defer close(runnerDone)
+		if err := scanService.Run(runnerCtx); err != nil && runnerCtx.Err() == nil {
+			logger.Error("scan runner stopped with an error", slog.String("reason", err.Error()))
+		}
+	}()
+
 	rulesetService, err := app.NewRulesetService(cfg, datastores.Mongo, logger)
 	if err != nil {
+		stopRunner()
+		<-runnerDone
 		return fmt.Errorf("ruleset service: %w", err)
+	}
+
+	// Ruleset generation used to belong to the worker. It belongs to whoever
+	// owns the scans, which is now this process, so it moved with them.
+	stopRulesets := func() {}
+	if rulesetService != nil {
+		stopRulesets = startRulesetRebuilder(ctx, rulesetService, cfg.RulesetRebuildInterval, logger)
 	}
 
 	srv := &http.Server{
@@ -115,7 +152,8 @@ func run() error {
 			Rulesets: rulesetService,
 		}).Handler(),
 		// Bound header reads so a stalled client cannot pin a goroutine
-		// forever; the scan pipeline runs elsewhere, so this stays tight.
+		// forever. The scan runner shares this process but holds no HTTP
+		// connection, so this stays tight.
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -132,6 +170,13 @@ func run() error {
 
 	select {
 	case err := <-errCh:
+		// The listener died on its own, so the signal-driven path below will
+		// never run and the background goroutines must be stopped here instead.
+		// Leaving them running would keep a process alive that can no longer
+		// serve anything.
+		stopRunner()
+		stopRulesets()
+		<-runnerDone
 		closeDatastores(datastores, logger)
 		return fmt.Errorf("listen: %w", err)
 	case <-ctx.Done():
@@ -148,6 +193,23 @@ func run() error {
 	if shutdownErr != nil {
 		// Force-close so a stuck connection cannot block container exit.
 		_ = srv.Close()
+	}
+
+	// Stop accepting requests before the runner, then stop the runner before
+	// MongoDB. The ordering is not incidental: a runner still polling while the
+	// store disconnects turns a clean shutdown into a burst of failed scans, and
+	// scans are the thing most expensive to get wrong here.
+	stopRunner()
+	stopRulesets()
+	select {
+	case <-runnerDone:
+		logger.Info("scan runner stopped cleanly")
+	case <-shutdownCtx.Done():
+		// A provider call can outlive any shutdown budget. An abandoned job is
+		// recovered by the lease rather than lost, so waiting longer would only
+		// delay exit for no benefit.
+		logger.Warn("scan runner did not stop within the shutdown budget; " +
+			"in-flight scans are recovered by lease expiry")
 	}
 
 	closeErr := datastores.Close(shutdownCtx)
@@ -168,4 +230,78 @@ func closeDatastores(d *app.Datastores, logger *slog.Logger) {
 	if err := d.Close(closeCtx); err != nil {
 		logger.Error("failed to close datastores", slog.String("error", err.Error()))
 	}
+}
+
+// startRulesetRebuilder regenerates and publishes the ruleset on a timer.
+//
+// It runs for the process's lifetime and stops with it. A failure is logged and
+// retried on the next tick: a ruleset that cannot be rebuilt leaves the
+// previously published one in force, which is strictly better than publishing
+// an empty one and telling every client it is unprotected.
+//
+// It returns a stop function rather than taking a context of its own, so the
+// caller's shutdown sequence can order this against the runner and the store
+// explicitly instead of relying on a shared cancellation.
+func startRulesetRebuilder(
+	ctx context.Context,
+	service *rulesetapi.Service,
+	interval time.Duration,
+	logger *slog.Logger,
+) func() {
+	if interval <= 0 {
+		interval = time.Minute
+	}
+
+	done := make(chan struct{})
+	loopCtx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		defer close(done)
+
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		// Publish once at startup, so a freshly-started process does not leave
+		// the ruleset stale for a whole interval.
+		rebuildOnce(loopCtx, service, logger)
+
+		for {
+			select {
+			case <-loopCtx.Done():
+				return
+			case <-ticker.C:
+				rebuildOnce(loopCtx, service, logger)
+			}
+		}
+	}()
+
+	return func() {
+		cancel()
+		<-done
+	}
+}
+
+func rebuildOnce(ctx context.Context, service *rulesetapi.Service, logger *slog.Logger) {
+	// Detached from ctx so an in-flight rebuild is allowed to finish rather than
+	// being cut off by the cancellation that stopped the ticker.
+	buildCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+	defer cancel()
+
+	snapshot, changed, err := service.Build(buildCtx)
+	switch {
+	case errors.Is(err, context.Canceled):
+		return
+	case err != nil:
+		logger.Warn("ruleset rebuild failed; the previously published ruleset stays in force",
+			slog.String("reason", err.Error()))
+		return
+	case !changed:
+		// The common case. Not bumping the version is what stops every scan
+		// from making every client re-download.
+		return
+	}
+
+	logger.Info("ruleset published",
+		slog.Int64("version", snapshot.Version),
+		slog.Int("rules", len(snapshot.Rules)))
 }

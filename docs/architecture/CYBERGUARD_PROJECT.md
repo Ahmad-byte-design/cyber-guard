@@ -6,8 +6,8 @@
 **Backend language:** Go  
 **Primary analysis provider:** Hybrid Analysis API v2  
 **Database:** MongoDB  
-**Queue/cache:** Redis with a Go task-queue adapter, if needed  
-**Deployment:** Docker Compose  
+**Work queue:** the `scans` collection itself — claimed with a time-bounded lease  
+**Deployment:** Docker Compose (`backend` + `mongodb`)  
 **Search engine:** Elasticsearch is optional and deferred until a concrete requirement exists
 
 ---
@@ -18,18 +18,18 @@ CyberGuard AI is an open-source URL threat-checking backend used by a browser ex
 
 The backend normalizes provider results into CyberGuard's own verdict model, stores privacy-conscious metadata and a keyed URL fingerprint, and publishes a versioned browser ruleset when an assessment justifies a rule.
 
-**Important scope distinction:** Go is the backend API and worker/orchestration language. Hybrid Analysis is still the external sandbox provider. Rewriting the backend in Go does not make Hybrid Analysis's remote sandbox execute faster; Go gives CyberGuard one backend language and can handle concurrent API/worker tasks efficiently.
+**Important scope distinction:** Go is the backend API and orchestration language. Hybrid Analysis is still the external sandbox provider. Rewriting the backend in Go does not make Hybrid Analysis's remote sandbox execute faster; Go gives CyberGuard one backend language and can handle concurrent API and scan-pipeline tasks efficiently.
 
 ### Product principles
 
 1. **Fast path first:** Reuse fresh results; do not start a new remote scan for every request.
 2. **Asynchronous analysis:** Do not keep the original HTTP request open for the full analysis lifecycle.
 3. **Keep secrets server-side:** Never embed the Hybrid Analysis API key in the extension or frontend assets.
-4. **Privacy-conscious storage:** Do not persist raw URLs by default. Use a backend-keyed HMAC fingerprint and redact URLs from logs. The actual URL may be needed transiently for provider submission; minimize its lifetime and protect any queue payload that temporarily contains it.
+4. **Privacy-conscious storage:** Do not persist raw URLs by default. Use a backend-keyed HMAC fingerprint and redact URLs from logs. The actual URL may be needed transiently for provider submission; minimize its lifetime and protect any stored copy that temporarily contains it.
 5. **Clear verdict semantics:** Use `malicious`, `suspicious`, `no_threat_detected`, and `unknown`. Scan status (`queued`, `running`, etc.) is separate from the verdict. Provider errors and timeouts must never be treated as safe.
 6. **Rules are not scan records:** The extension's block/redirect rules are a generated, versioned output—not the database itself.
 7. **No broad crawling by default:** Analyze the submitted URL and redirects observed by the provider. Do not enumerate arbitrary paths or subdomains unless the target is owned by, or explicitly authorized for testing by, the organization.
-8. **Modular monolith first:** Keep one Go codebase with clear internal module boundaries. Run the API and worker as separate processes/binaries using the same application modules.
+8. **Modular monolith first:** Keep one Go codebase with clear internal module boundaries, and run it as **one process**. The API serves HTTP and runs the scan pipeline on its own goroutines. The decoupling that matters is between the request and the analysis, not between two processes: `check-url` returns `202` immediately and a detonation that takes minutes never holds a connection open, because no request is waiting on it.
 
 ## 2. MVP scope
 
@@ -53,7 +53,7 @@ The backend normalizes provider results into CyberGuard's own verdict model, sto
 - Employee accounts, Active Directory, SSO, or a security dashboard unless separately scoped.
 - Elasticsearch as a dependency for exact URL fingerprint lookups.
 - Guaranteed interception/blocking of every browser navigation. An ordinary extension cannot transparently pause every kind of navigation while waiting for remote analysis; stronger enforcement may require a managed web gateway or network proxy.
-- A separate Go microservice solely to call Hybrid Analysis. The Go API/worker can call the provider directly through a provider adapter.
+- A separate Go microservice solely to call Hybrid Analysis. The Go API calls the provider directly through a provider adapter, and runs the analysis on its own goroutines.
 
 ## 3. High-level architecture
 
@@ -65,10 +65,10 @@ flowchart TD
     VALIDATE --> FP[HMAC URL Fingerprint]
     FP --> CACHE{Fresh assessment?}
     CACHE -->|Yes| RESULT[Normalized Assessment]
-    CACHE -->|No| JOB[Create or reuse scan job]
-    JOB --> QUEUE[Redis-backed Queue, if enabled]
-    QUEUE --> WORKER[Go Scan Worker]
-    WORKER --> HA[Hybrid Analysis Adapter]
+    CACHE -->|No| JOB[Create or reuse scan document]
+    JOB --> CLAIM{Claimable? atomic lease}
+    CLAIM --> SCANRUNNER[In-process scan runner]
+    SCANRUNNER --> HA[Hybrid Analysis Adapter]
     HA --> PROVIDER[Hybrid Analysis API v2]
     PROVIDER --> POLL[Retrieve/poll provider result]
     POLL --> NORMALIZE[Normalize provider result]
@@ -84,13 +84,12 @@ flowchart TD
 - **Browser extension:** Maintains a bounded local verdict cache and installed ruleset version, requests checks, retrieves scan status, synchronizes rules, and applies supported `declarativeNetRequest` rules.
 - **Go HTTP API:** Request validation, routing, rate limiting, scan creation/reuse, status responses, ruleset delivery, and health endpoints.
 - **URL Intelligence:** URL validation, carefully defined normalization, hostname/registrable-domain extraction, and HMAC fingerprinting.
-- **Scan Management:** Cache lookup, idempotency, state transitions, duplicate-job prevention, timeouts, and retry decisions.
-- **Go scan worker:** Executes queue tasks and coordinates submission/polling without blocking API requests.
+- **Scan Management:** Cache lookup, idempotency, state transitions, duplicate-scan prevention, timeouts, and retry decisions.
+- **Scan runner (goroutines inside the API process):** Claims scans by lease and coordinates submission/polling without blocking any HTTP request. It shares the binary, not the request path.
 - **Hybrid Analysis adapter:** Contains all provider-specific authentication, endpoints, request/response types, polling rules, and provider-error translation.
 - **Verdict Normalization:** Converts external provider data into CyberGuard's stable result format.
 - **Rulesets:** Produces and validates versioned browser rules based on eligible findings.
-- **MongoDB:** Authoritative store for scan records, assessment metadata, provider references, and ruleset snapshots.
-- **Redis (optional but recommended for async tasks):** Queue broker and short-lived coordination/cache where needed. Do not treat Redis as the authoritative assessment database.
+- **MongoDB:** Authoritative store for scan records, assessment metadata, provider references, and ruleset snapshots — and the work queue. A scan is work by being claimable, and claiming is an atomic lease on the scan document, so there is no second datastore and no second source of truth about pending work.
 - **Elasticsearch (optional later):** Derived index for large-scale indicator/report search. It is not needed for the primary exact-fingerprint lookup.
 
 ## 4. Recommended repository structure
@@ -101,9 +100,9 @@ Use idiomatic Go packaging and keep business modules under `internal/` so implem
 cyberguard-ai/
 ├── cmd/
 │   ├── api/
-│   │   └── main.go                 # Starts the HTTP API
-│   └── worker/
-│       └── main.go                 # Starts asynchronous scan workers
+│   │   └── main.go                 # Serves the HTTP API and runs the scan pipeline
+│   └── migrate/
+│       └── main.go                 # One-shot index/schema step
 ├── internal/
 │   ├── config/                     # Environment/config parsing and validation
 │   ├── transport/
@@ -122,9 +121,8 @@ cyberguard-ai/
 │   │   ├── rulesets/               # Browser rules generation and versioning
 │   │   └── health/                 # Liveness/readiness use cases
 │   ├── platform/
-│   │   ├── mongodb/                # MongoDB client, repositories, indexes
-│   │   ├── queue/                  # Queue interface + selected adapter
-│   │   ├── redis/                  # Redis setup when required
+│   │   ├── mongodb/                # MongoDB client, repositories, indexes, claim leases
+│   │   ├── queue/                  # Delivery interface + MongoDB adapter over `scans`
 │   │   └── observability/          # Logger, metrics, correlation IDs
 │   └── app/                        # Dependency wiring and service composition
 ├── extension/                      # Separate browser-extension project/build
@@ -159,11 +157,18 @@ cyberguard-ai/
 
 - **HTTP:** Go standard library `net/http`; consider `github.com/go-chi/chi/v5` for composable routing/middleware without hiding standard HTTP semantics.
 - **MongoDB:** Official Go driver (`go.mongodb.org/mongo-driver/v2/mongo`). Verify the driver's Go-version requirement against the Go toolchain selected for the repository.
-- **Queue:** Use a small internal queue interface. If using Redis, evaluate a maintained Go task-queue library such as Asynq; check its current release/stability status and operational requirements before committing. It is acceptable to start with synchronous mocked worker logic for the earliest milestone, but do not make provider analysis block normal HTTP handlers.
+- **Queue:** Use a small internal delivery interface, and keep the
+  implementation in MongoDB. A scan becomes work by being claimable, and a claim
+  is a time-bounded lease stamped by one atomic `findAndModify` — exclusivity
+  and recovery both come from the server, with no sweeper and no promoter. Do
+  not reintroduce a broker to make the asynchronous property true; the property
+  is that no HTTP request waits on an analysis, and it holds with goroutines in
+  the same process. If a broker is ever justified by measured load, keep the
+  interface and reimplement it behind it.
 - **Configuration:** Read environment variables through a small validated config package; avoid a large configuration framework unless needed.
 - **Logging:** Use structured logging from the Go standard library (`log/slog`) unless an observed requirement justifies another logger.
 
-Do not create interfaces for every function. Add interfaces at boundaries that need substitution or test doubles: repository, analysis provider, queue, and clock where expiration tests benefit from it.
+Do not create interfaces for every function. Add interfaces at boundaries that need substitution or test doubles: repository, analysis provider, delivery, and clock where expiration tests benefit from it.
 
 ## 5. Modules and boundaries
 
@@ -189,12 +194,16 @@ Do not casually lowercase paths, remove query parameters, or reorder query value
 Responsibilities:
 - Look up a fresh assessment by URL fingerprint.
 - Deduplicate concurrent requests for the same fingerprint.
-- Create a scan record and queue task when needed.
+- Create a scan record; work is claimed from that record by lease.
 - Track scan states: `queued`, `submitting`, `submitted`, `running`, `completed`, `failed`, `timed_out`.
 - Track attempt count, next retry time, provider scan ID, timestamps, and safe error codes.
 - Expose status/result by opaque scan ID.
 - Prevent repeated client requests from creating unlimited provider submissions.
 - Treat cache expiration as a policy/configuration choice, not a permanent safety guarantee.
+
+Deduplication is enforced by a partial unique index in MongoDB, not by a
+read-then-write check, so it does not depend on the application behaving
+correctly under a race. Claiming works the same way for the same reason.
 
 ### 5.3 `providers/hybranalysis` — Provider integration
 
@@ -260,9 +269,9 @@ Provide:
 - `GET /health/live`: process is alive.
 - `GET /health/ready`: required dependencies can be reached.
 - Structured logs with request/scan correlation IDs.
-- Metrics for cache hit rate, queue age, provider latency, retries, failures, timeouts, and polling volume.
+- Metrics for cache hit rate, time from scan creation to first claim, provider latency, retries, failures, timeouts, and polling volume.
 - Redaction of raw URLs, query strings, API keys, and provider secrets.
-- Graceful shutdown with bounded timeouts for API and worker processes.
+- Graceful shutdown with bounded timeouts. The listener stops accepting first, then the scan runner, then MongoDB — in that order, so a runner still polling while the store disconnects cannot turn a clean shutdown into a burst of failed scans.
 
 ## 6. API contract
 
@@ -379,7 +388,7 @@ Suggested document:
 }
 ```
 
-Raw URL is deliberately absent. The raw URL is needed temporarily for provider submission. If an asynchronous queue needs it, prefer a short-lived encrypted payload, minimize retention, restrict access, and ensure logs never print it. Delete the transient value as soon as submission no longer requires it. A fingerprint is not encryption and does not guarantee anonymity.
+Raw URL is deliberately absent. The raw URL is needed temporarily for provider submission. It is held only in a short-lived encrypted record: encrypt, minimize retention, restrict access, and ensure logs never print it. Delete the transient value as soon as submission no longer requires it. A fingerprint is not encryption and does not guarantee anonymity.
 
 Suggested indexes:
 - Unique index on `url_fingerprint` for exact-URL assessments.
@@ -390,9 +399,42 @@ Suggested indexes:
 
 Keep exact-URL verdicts separate from hostname/domain reputation. Do not infer that all paths or subdomains are safe or malicious based solely on one URL's result.
 
-### Transient scan jobs
+### Scan documents are the work queue
 
-A job record may contain scan metadata, status, attempt count, timestamps, provider scan ID, and a reference to an encrypted short-lived submission payload if necessary. Avoid storing a long-lived copy of raw URLs. Define cleanup behavior and recovery of jobs after a worker restart.
+The `scans` document carries three claim fields alongside its lifecycle state:
+
+```json
+{
+  "_id": "scan_01ABC",
+  "status": "running",
+  "available_at": "2026-10-16T12:00:05Z",
+  "lease_owner": "api-6f4c1/41",
+  "lease_expires_at": "2026-10-16T12:05:35Z"
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `available_at` | When this scan next becomes claimable. Absent means due now. A deferred retry is just a future value here. |
+| `lease_owner` | Which process holds it. Diagnostic only — a lease is released by expiry, not by matching this string. |
+| `lease_expires_at` | When the claim lapses. Absent or null means unclaimed. |
+
+Back them with an index on `{status, available_at, lease_expires_at}`. Without
+it, claiming is still correct but degrades into a collection scan over all
+history, so the queue gets slower the more it has been used.
+
+A claim is one atomic `findAndModify` that matches a claimable scan and stamps
+the lease in the same operation, which is what makes it exclusive: a second
+claimant matches nothing. Nothing enforces that a consumer which dies releases
+anything, so the lease is time-bounded and **the clock is the recovery
+mechanism** — no sweeper, no reaper, no reconciler for delivery.
+
+The lease must be longer than the longest possible unit of work (a provider
+poll), or a second consumer could start a scan whose analysis is still running.
+Derive it from the poll deadline plus a configured headroom rather than letting
+it be set independently, so no configuration produces a double submission.
+
+A job record may contain scan metadata, status, attempt count, timestamps, provider scan ID, and a reference to an encrypted short-lived submission payload if necessary. Avoid storing a long-lived copy of raw URLs. Define cleanup behavior and recovery of jobs after a consumer restart.
 
 ## 8. Elasticsearch decision
 
@@ -409,14 +451,22 @@ Suggested sequence:
 3. Look up a fresh assessment.
 4. If one exists, return it without provider submission.
 5. If a scan for the same fingerprint is already in progress, return/reuse its scan ID.
-6. Otherwise, create a scan and enqueue an idempotent task.
-7. Worker submits the URL through the Hybrid Analysis adapter, if permitted by key privileges and provider terms.
+6. Otherwise, create a scan. It is claimable the moment it exists — there is no
+   separate enqueue step that can succeed or fail independently.
+7. The in-process scan runner claims it by lease, reads the encrypted URL, and
+   submits it through the Hybrid Analysis adapter, if permitted by key privileges
+   and provider terms.
 8. Persist the provider scan ID and status.
 9. Poll according to current documented provider behavior and rate limits, using bounded backoff.
 10. Normalize the provider's terminal result.
 11. Persist the assessment and expiry.
 12. Regenerate/publish the ruleset only when the effective rules change.
 13. Client polls the status endpoint or uses a future push mechanism if added later.
+
+Step 6 returning before step 7 begins is the whole asynchronous property. The
+client got `202` while no analysis existed yet; the analysis then runs on the
+API's own goroutines. A detonation measured in minutes changes nothing about how
+long an HTTP connection is held open, because none is waiting on it.
 
 Reliability requirements:
 - Use request-level and provider-level timeouts.
@@ -425,7 +475,8 @@ Reliability requirements:
 - Do not retry invalid requests or authorization failures indefinitely.
 - Prevent duplicate submissions for concurrent equivalent requests.
 - Use idempotency keys or atomic conditional updates where appropriate.
-- Provide graceful shutdown and worker recovery.
+- Provide graceful shutdown and recovery of work abandoned by a killed process —
+  here, lease expiry rather than a queue reconciler.
 - Make TTL/expiry values configurable and verdict-aware; a cached result is not a permanent guarantee of safety.
 
 ## 10. Browser extension integration
@@ -451,9 +502,9 @@ Reliability requirements:
 8. Treat provider responses as untrusted input: validate schema, lengths, identifiers, and status values.
 9. Never turn `unknown`, timeout, or provider error into a safe verdict.
 10. Keep dependency and image updates part of maintenance.
-11. Do not expose MongoDB, Redis, Elasticsearch, or worker-control ports publicly by default.
+11. Do not expose MongoDB or Elasticsearch ports publicly by default. The API is the only published port.
 12. Use non-root containers, minimal images, read-only filesystems where practical, and graceful shutdown.
-13. Avoid mounting the Docker socket into any application or worker container.
+13. Avoid mounting the Docker socket into any application container.
 
 ## 12. Configuration and secrets
 
@@ -467,40 +518,54 @@ LOG_LEVEL=info
 MONGODB_URI=mongodb://mongodb:27017
 MONGODB_DATABASE=cyberguard
 
-REDIS_ADDR=redis:6379
-REDIS_PASSWORD=
-QUEUE_ENABLED=true
-
 HYBRID_ANALYSIS_BASE_URL=https://www.hybrid-analysis.com/api/v2
 HYBRID_ANALYSIS_API_KEY=
 URL_FINGERPRINT_HMAC_KEY=
+URL_ENCRYPTION_KEY=
+
+# Claim pacing and lease sizing for the in-process scan runner.
+# The lease is derived from the poll deadline plus the headroom and validated at
+# startup, so there is no setting that can produce a double submission.
+WORKER_POLL_DEADLINE=5m
+WORKER_CLAIM_POLL_GAP=250ms
+CLAIM_LEASE_HEADROOM=30s
 
 ELASTICSEARCH_ENABLED=false
 ELASTICSEARCH_URL=http://elasticsearch:9200
 ```
 
+Rate-limit counters are in-process, so no Redis configuration exists. That is
+the one trade this brings: the configured limits are **per replica**, and a
+restart resets them. Acceptable at one replica; not acceptable against a hard
+financial ceiling at several.
+
 Never commit `.env`, production API keys, HMAC keys, or production secrets. Use separate local and production credentials. Verify exact provider endpoint paths, required headers, payload parameters, and automated-submission permissions against the official API v2 documentation before implementing the real client.
 
 ## 13. Docker Compose topology
 
-Initial services:
-- `api`: Go HTTP API binary.
-- `worker`: Go worker binary built from the same codebase/image, with a separate command/entrypoint.
-- `mongodb`: source-of-truth data store.
-- `redis`: queue broker if the chosen queue implementation uses Redis.
+Actual services:
+- `backend`: Go process serving the HTTP API **and** running the scan pipeline.
+- `mongodb`: source-of-truth data store, and the work queue.
+- `migrate`: one-shot index creation, run before the API starts.
 
 Optional later service:
 - `elasticsearch`: derived search index only when justified.
 
 Requirements:
-- Internal services connect through Compose service names such as `mongodb` and `redis`, not `localhost` from another container.
+- Internal services connect through Compose service names such as `mongodb`, not `localhost` from another container.
 - Publish only the API port for local development by default.
-- Keep MongoDB, Redis, and Elasticsearch on an internal network.
+- Keep MongoDB and Elasticsearch on an internal network.
 - Add health checks and dependency readiness handling.
 - Use persistent volumes for MongoDB; document that volumes alone are not backups.
 - Use multi-stage Docker builds, minimal runtime images, and a non-root user where practical.
 - Avoid mounting the Docker socket into application containers.
-- Provide a single Go binary with commands such as `api` and `worker`, or separate binaries built from `cmd/api` and `cmd/worker`.
+- Ship one binary. A second one is not a scaling lever here: replicas already
+  contend for work safely through the lease, and splitting analysis into its own
+  process would re-introduce the second source of truth that the lease removed.
+
+Note what is *not* required, because it is easy to assume a queue broker is
+involved: there is no broker service, no queue container, and no queue process.
+A scan is work by being claimable in MongoDB.
 
 ## 14. Testing strategy
 
@@ -514,13 +579,22 @@ Requirements:
 
 ### Integration tests
 - A fresh cached assessment returns without provider submission.
-- A cache miss creates exactly one task.
+- A cache miss creates exactly one claimable scan.
 - Concurrent duplicate requests reuse an in-progress scan.
 - MongoDB indexes are created and used as expected.
-- Worker recovers after transient provider errors.
+- **A claim is exclusive against a real MongoDB.** This is a property of the
+  server, not of our code, so no in-memory double can stand in for it.
+- **A lapsed lease becomes claimable again with nothing running to notice** — the
+  recovery path a killed consumer leaves behind.
+- A scan with no claim fields at all is still claimable, so documents written
+  before those fields existed are never stranded.
+- A consumer recovers after transient provider errors.
 - Provider 401, 403, 429, 5xx, timeout, malformed payload, and unknown status are handled safely.
 - Raw URLs and secrets are absent from logs.
 - Ruleset endpoint returns unchanged state when the version is current and a new snapshot when rules change.
+
+The integration suite needs MongoDB and nothing else. There is no second
+datastore to start.
 
 ### Extension tests
 - Valid rules snapshots are applied.
@@ -536,7 +610,7 @@ Use mocked provider responses for automated tests. Do not submit arbitrary live 
 - Initialize `go.mod` and the repository layout.
 - Select and pin compatible versions of Go dependencies.
 - Add configuration validation, `log/slog`, HTTP router, graceful shutdown, and health endpoints.
-- Add Docker Compose with API, MongoDB, and optional Redis.
+- Add Docker Compose with the API and MongoDB.
 - Add CI format/lint/test commands (`gofmt`, `go vet`, unit tests, and any selected linter).
 
 ### Milestone 2 — URL Intelligence + MongoDB
@@ -545,10 +619,12 @@ Use mocked provider responses for automated tests. Do not submit arbitrary live 
 - Implement MongoDB connection, repositories, indexes, and assessment lookup.
 - Add cache-hit behavior and expiry handling.
 
-### Milestone 3 — Scan Management + worker
+### Milestone 3 — Scan Management + claim queue
 - Define scan states and transitions.
 - Implement atomic deduplication for concurrent requests.
-- Add the queue adapter and worker.
+- Add the delivery adapter over the `scans` collection: atomic claim, lease,
+  expiry, retry deferral.
+- Run the scan pipeline on goroutines inside the API process.
 - Implement safe retry/backoff and provider failure mapping.
 
 ### Milestone 4 — Hybrid Analysis adapter
@@ -579,27 +655,29 @@ Use mocked provider responses for automated tests. Do not submit arbitrary live 
 - A URL sent by the extension reaches the Go API.
 - Invalid URL schemes and malformed inputs are rejected.
 - A fresh cached result is reused without duplicate provider submission.
-- A cache miss creates one asynchronous task.
+- A cache miss creates one claimable scan.
+- No HTTP request is held open while an analysis runs.
 - Provider responses map to CyberGuard's stable scan-state/verdict model.
 - The extension can retrieve scan status and a completed assessment.
 - The extension downloads only changed rulesets.
 - Failed, expired, and inconclusive results are never mislabeled as safe.
 - API keys remain server-side and do not appear in logs.
-- MongoDB and Redis ports are not exposed publicly by default.
+- MongoDB's port is not exposed publicly by default.
 - Tests cover cache behavior, concurrent deduplication, provider errors, and ruleset versioning.
 
 ## 17. Architecture decisions
 
 | Decision | Initial choice | Reason |
 |---|---|---|
-| Backend | Go modular monolith | One language for API and worker, with explicit module boundaries |
+| Backend | Go modular monolith | One language, one process, explicit module boundaries |
 | HTTP | `net/http`, optionally with `chi` | Idiomatic HTTP and small routing layer |
 | Sandbox | Hybrid Analysis API | Avoid building and securing a custom sandbox in the initial version |
 | Data store | MongoDB | Flexible provider metadata and indexed assessment lookup |
-| Queue | Queue interface + Redis-backed implementation if needed | Keeps long-running provider work outside request handlers and permits later replacement |
+| Queue | The `scans` collection; delivery by time-bounded lease | The ledger already knew what work existed, so a broker was a second source of truth about it. A lease keeps long-running provider work off the request path with one fewer process and one fewer failure mode |
 | Search | MongoDB indexes first; Elasticsearch optional | Avoid unnecessary infrastructure for exact lookups |
 | Raw URLs | Not retained by default | Reduces exposure of sensitive query parameters and tokens |
-| Scan execution | Asynchronous worker | Supports retries, polling, and duplicate-job controls |
+| Scan execution | Asynchronous, in-process goroutines | Supports retries, polling and duplicate-scan controls. The request is released before analysis starts, which is the property that matters — not process separation |
+| Rate-limit counters | In-process fixed windows | No second datastore to fail when abuse control is load-bearing. Costs per-replica scope; revisit before running more than one replica |
 | Extension rules | Versioned ruleset snapshot | Avoids repeatedly downloading unchanged rules and separates enforcement data from scan history |
 
 ## 18. Official references
@@ -609,7 +687,7 @@ Use mocked provider responses for automated tests. Do not submit arbitrary live 
 - MongoDB Go Driver: https://www.mongodb.com/docs/drivers/go/current/
 - MongoDB Go Driver repository: https://github.com/mongodb/mongo-go-driver
 - `chi` HTTP router: https://github.com/go-chi/chi
-- Asynq Go task queue: https://github.com/hibiken/asynq
+- MongoDB `findAndModify` semantics (atomic per document): https://www.mongodb.com/docs/manual/reference/method/db.collection.findAndModify/
 - Chrome `declarativeNetRequest`: https://developer.chrome.com/docs/extensions/reference/api/declarativeNetRequest
 - OWASP SSRF Prevention Cheat Sheet: https://cheatsheetseries.owasp.org/cheatsheets/Server_Side_Request_Forgery_Prevention_Cheat_Sheet.html
 

@@ -1,6 +1,7 @@
 # 0013 — Durable jobs: scan IDs in the queue, encrypted transient URLs
 
-- **Status:** Accepted
+- **Status:** Accepted, **amended** by
+  [ADR 0019](0019-mongodb-queue-and-in-process-runner.md)
 - **Date:** 2026-10-16
 - **Supersedes:** [ADR 0003](0003-asynchronous-analysis-jobs.md)
 - **Affects:** `data-model.md`, `architecture.md`, `security-and-privacy.md`,
@@ -14,10 +15,23 @@ queue and flagged an unresolved tension:
 > The queue is durable, so the URL must survive a restart — but the privacy
 > design forbids storing raw URLs.
 
-Redis is now confirmed as part of the MVP
-([ADR 0017](0017-redis-in-the-mvp.md)), which makes the tension sharper, not
+Redis was subsequently made part of the MVP
+([ADR 0017](0017-redis-in-the-mvp.md)), which made the tension sharper, not
 easier: a Redis queue is backed up, replicated, inspectable with
 `redis-cli KEYS`, and frequently retained longer than a MongoDB TTL index.
+
+> **Amended 2026-10-17.** [ADR 0019](0019-mongodb-queue-and-in-process-runner.md)
+> removed Redis and made the scans collection the queue. That dissolves the
+> tension this record exists to manage rather than resolving it, and the
+> distinction matters. The privacy decision below is unchanged and is now
+> enforced *structurally*: the queue payload is not a separate record that
+> happens not to contain a URL, it is the scan document, which has no field a raw
+> URL could occupy — only a hostname, a registrable domain, and a keyed HMAC. The
+> encrypted transient collection is still where the plaintext lives, still
+> deleted on read, still TTL-bounded. What changed is that there is now one fewer
+> store to be careful in, and one fewer place the rule could be forgotten.
+>
+> Every claim below about Redis as a second system is now historical.
 
 CyberGuard's central promise is that raw URLs are never retained. A queue
 payload containing plaintext URLs would falsify that promise for as long as the
@@ -102,7 +116,7 @@ is holding a plaintext URL for the duration of a retry backoff, in exchange for
 saving one client round trip. The client re-submits instead, which is bounded by
 the per-fingerprint budget.
 
-## Dispatch: MongoDB is the ledger, Redis is delivery
+## Dispatch: MongoDB is the ledger (Redis as delivery — historical)
 
 The workflow spans four writes to two systems, and MongoDB plus Redis is not one
 transaction. The phase-4 implementation orders them:
@@ -164,7 +178,7 @@ one second. For a sandbox detonation that is irrelevant.
 A job for a finished scan is a no-op. A job for a scan holding a provider job ID
 resumes polling rather than submitting again. A verdict write is an upsert keyed
 by fingerprint. The one thing never repeated is a provider submission — see
-`internal/scans/worker.go`, which explains why a submission cannot be safely
+`internal/scans/runner.go`, which explains why a submission cannot be safely
 retried when its outcome is unknown.
 
 ### Queue ordering

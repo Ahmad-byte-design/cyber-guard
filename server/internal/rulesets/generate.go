@@ -6,9 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
 	"sort"
-	"strings"
 	"time"
 
 	"cyberguard/server/internal/urlintel"
@@ -54,6 +52,14 @@ type Candidate struct {
 
 	// Scheme is "http" or "https".
 	Scheme string
+
+	// Port is the URL's explicit port, empty when the URL used the default for
+	// its scheme.
+	//
+	// It is carried because dropping it silently broadens a rule: an assessment
+	// of `https://host.test:8443/login` would otherwise produce a rule covering
+	// `https://host.test/login`, which nobody assessed. Recorded in ADR 0019.
+	Port string
 
 	// PathPrefix is the URL path, with no query string and no fragment.
 	//
@@ -207,19 +213,34 @@ func (g *Generator) Generate(ctx context.Context, candidates []Candidate, now ti
 		rules = append(rules, rule)
 	}
 
-	// Enforce the cap, dropping the broadest rules first. A host-wide rule and
-	// a single-URL rule protect the same host, so when space runs out the
+	// Enforce Chrome's regex limit before the total limit. It is the tighter
+	// constraint and the one whose failure mode is silent, so it must be
+	// applied to the same rule set the total cap then considers.
+	rules, regexDropped := capRegexRules(rules, g.policy.MaxRegexRules)
+	suppressed += regexDropped
+
+	// Enforce the total cap, dropping the broadest rules first. A host-wide rule
+	// and a single-URL rule protect the same host, so when space runs out the
 	// narrower one is both safer and more informative.
 	rules, dropped := capRules(rules, g.policy.MaxRules)
 	suppressed += dropped
 
-	// Assign identifiers by position. Chrome requires contiguous identifiers
-	// from 1, and position-derived IDs stay stable for a client diffing two
-	// versions as long as the ordering is deterministic — which the sort above
-	// guarantees.
+	// Assign identifiers by position.
+	//
+	// Chrome requires unique positive integers; contiguity is a convention this
+	// engine keeps because it makes a snapshot readable and diffable. Position-
+	// derived identifiers are stable across rebuilds *because* the ordering is
+	// deterministic, which sortCandidates guarantees — the same evidence always
+	// produces the same order, so the same rule keeps the same ID across
+	// versions.
+	//
+	// What IDs are not is stable under removal: dropping the first rule shifts
+	// every later ID by one. That is acceptable because a client replaces the
+	// whole ruleset rather than reconciling rule-by-rule, and an ID that stayed
+	// put while its meaning changed would be worse. See ADR 0019.
 	for i := range rules {
 		rules[i].ID = i + 1
-		rules[i].Priority = 1
+		rules[i].Priority = g.policy.Priority
 	}
 
 	if err := ValidateAll(rules); err != nil {
@@ -285,54 +306,121 @@ func pickScope(scopes []Scope, c Candidate) (Scope, bool) {
 }
 
 // buildRule constructs one rule at the given scope.
+//
+// A candidate that cannot be expressed safely at this scope is rejected rather
+// than widened. That is the whole point: a rule that quietly matches more than
+// the assessment licensed is worse than no rule, because it blocks something
+// nobody assessed and the failure is invisible.
 func (g *Generator) buildRule(c Candidate, scope Scope) (Rule, error) {
+	resourceTypes, err := ResourceTypesForAction(g.policy.Action, g.policy.ResourceProfile)
+	if err != nil {
+		return Rule{}, err
+	}
+
 	rule := Rule{
-		Priority: 1,
-		Action:   Action{Type: Block},
+		Priority: g.policy.Priority,
+		Action:   g.action(),
 		Condition: Condition{
-			// Every navigable and sub-resource type: a phishing payload is very
-			// often delivered by a script or an iframe rather than the main
-			// frame, and a main-frame-only rule would miss it.
-			ResourceTypes: append([]string(nil), resourceTypes...),
+			ResourceTypes: resourceTypes,
 		},
 		Provenance: Provenance{
 			Fingerprint:       c.Fingerprint,
 			RegistrableDomain: c.RegistrableDomain,
 			Scope:             scope,
 			Corroboration:     g.policy.corroborationRequired(scope),
+			Action:            g.policy.Action,
 		},
 	}
 
 	switch scope {
 	case ScopeExactURL:
-		// urlFilter cannot express "exactly this URL and nothing else", so the
-		// exact scope uses an anchored regex.
-		//
-		// The URL carries no query string. That is a deliberate narrowing of
-		// both storage and blast radius: queries carry session tokens, so
-		// persisting or publishing one would reintroduce exactly the sensitive
-		// material the fingerprint exists to avoid. The trade is that two URLs
-		// differing only in query share a rule, which blocks slightly more than
-		// true exactness — recorded in ADR 0018.
-		target := c.Scheme + "://" + c.Hostname + normalisePath(c.PathPrefix)
-		rule.Condition.Filter = &Filter{
-			Type:        FilterTypeRegex,
-			RegexFilter: "^" + regexp.QuoteMeta(target) + "$",
+		// urlFilter cannot express "this URL and nothing else": `||host^/p` is
+		// a prefix match and would also cover `/p/admin`. An anchored regex can,
+		// and RE2 escaping is well defined, so this is the one scope where a
+		// path containing a filter operator is still safely expressible.
+		pattern, err := ExactURLRegex(c.Scheme, c.Hostname, c.Port, c.PathPrefix)
+		if err != nil {
+			return Rule{}, err
 		}
+		rule.Condition.Filter = &Filter{Type: FilterTypeRegex, RegexFilter: pattern}
 
 	case ScopeURLPrefix:
-		rule.Condition.URLFilter = "||" + escapeHost(c.Hostname) + "^" + escapePathPrefix(normalisePath(c.PathPrefix))
+		filter, err := PrefixFilter(c.Hostname, c.PathPrefix)
+		if err != nil {
+			return Rule{}, err
+		}
+		rule.Condition.URLFilter = filter
 
 	case ScopeRegistrableDomain:
-		// The broadest rung. `||host^` matches the domain and its subdomains,
-		// which is exactly why it needs the most evidence.
-		rule.Condition.URLFilter = "||" + escapeHost(c.RegistrableDomain) + "^"
+		filter, err := DomainFilter(c.RegistrableDomain)
+		if err != nil {
+			return Rule{}, err
+		}
+		rule.Condition.URLFilter = filter
 
 	default:
 		return Rule{}, fmt.Errorf("rulesets: cannot build a rule for scope %q", scope)
 	}
 
 	return rule, nil
+}
+
+// action returns the configured action, including the redirect target.
+func (g *Generator) action() Action {
+	if g.policy.Action != ActionRedirect {
+		return Action{Type: ActionBlock}
+	}
+	return Action{
+		Type:     ActionRedirect,
+		Redirect: &Redirect{ExtensionPath: g.policy.RedirectPath},
+	}
+}
+
+// capRegexRules drops regex-scoped rules beyond Chrome's per-ruleset limit.
+//
+// # Why this cannot be left to the total rule cap
+//
+// Chrome caps regular-expression rules at 1000 per ruleset type, separately
+// from and far below the total rule limit. A snapshot of 5000 exact-URL rules —
+// all of them regex — is within this engine's size cap and completely
+// uninstallable, and Chrome's symptom is that the ruleset is ignored rather
+// than rejected, so a client would quietly carry no protection at all.
+//
+// Regex rules are therefore dropped narrowest-first. A registrable-domain rule
+// covers everything an exact-URL rule would, so keeping the broad rule when
+// space runs out protects more, not less.
+func capRegexRules(rules []Rule, limit int) ([]Rule, int) {
+	var regexCount int
+	for _, r := range rules {
+		if r.Condition.Filter != nil {
+			regexCount++
+		}
+	}
+	if limit <= 0 || regexCount <= limit {
+		return rules, 0
+	}
+
+	ordered := append([]Rule(nil), rules...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		a, b := ordered[i].Provenance.Scope.Severity(), ordered[j].Provenance.Scope.Severity()
+		if a != b {
+			return a < b // narrower scope first, so it is dropped first
+		}
+		return ordered[i].Provenance.Fingerprint < ordered[j].Provenance.Fingerprint
+	})
+
+	dropRegex := regexCount - limit
+	dropped := 0
+	kept := make([]Rule, 0, len(rules))
+
+	for _, r := range ordered {
+		if dropped < dropRegex && r.Condition.Filter != nil {
+			dropped++
+			continue
+		}
+		kept = append(kept, r)
+	}
+	return kept, dropped
 }
 
 // capRules enforces MaxRules, dropping the broadest scopes first.
@@ -436,40 +524,6 @@ func digestOf(rules []Rule) string {
 
 	sum := sha256.Sum256(encoded)
 	return hex.EncodeToString(sum[:])
-}
-
-// normalisePath makes a path comparable and filter-safe.
-//
-// An empty path is "/" so that a bare host does not produce "https://host".
-func normalisePath(p string) string {
-	p = strings.TrimSpace(p)
-	if p == "" {
-		return "/"
-	}
-	if !strings.HasPrefix(p, "/") {
-		p = "/" + p
-	}
-	return p
-}
-
-// pathSegments counts the non-empty segments of a path.
-func pathSegments(p string) int {
-	p = strings.TrimSpace(p)
-	if p == "" || p == "/" {
-		return 0
-	}
-	n := 0
-	for _, seg := range strings.Split(p, "/") {
-		if seg != "" {
-			n++
-		}
-	}
-	return n
-}
-
-// escapePathPrefix escapes a path for the urlFilter prefix form.
-func escapePathPrefix(p string) string {
-	return escapeURLFilter(normalisePath(p))
 }
 
 // DeriveDomain returns the registrable domain for a hostname.

@@ -15,7 +15,7 @@ func clearEnv(t *testing.T) {
 	for _, key := range []string{
 		"HTTP_ADDR", "LOG_LEVEL", "LOG_FORMAT", "SHUTDOWN_TIMEOUT",
 		"MONGODB_URI", "MONGODB_DATABASE", "MONGODB_CONNECT_TIMEOUT", "MONGODB_PING_TIMEOUT",
-		"REDIS_ADDR", "REDIS_PASSWORD", "REDIS_DB", "REDIS_PING_TIMEOUT",
+		"WORKER_CLAIM_POLL_GAP", "CLAIM_LEASE_HEADROOM",
 		"HEALTH_CHECK_TIMEOUT", "WORKER_POLL_INTERVAL",
 		"HYBRID_ANALYSIS_BASE_URL", "HYBRID_ANALYSIS_API_KEY", "URL_FINGERPRINT_HMAC_KEY",
 	} {
@@ -36,9 +36,6 @@ func TestLoadDefaultsAreUsable(t *testing.T) {
 	if cfg.MongoURI != "mongodb://mongodb:27017" {
 		t.Errorf("MongoURI = %q, want the mongodb service name", cfg.MongoURI)
 	}
-	if cfg.RedisAddr != "redis:6379" {
-		t.Errorf("RedisAddr = %q, want the redis service name", cfg.RedisAddr)
-	}
 	if cfg.HTTPAddr != ":8080" {
 		t.Errorf("HTTPAddr = %q, want :8080", cfg.HTTPAddr)
 	}
@@ -48,11 +45,16 @@ func TestLoadDefaultsAreUsable(t *testing.T) {
 	if cfg.MongoConnectTimeout != 10*time.Second || cfg.MongoPingTimeout != 5*time.Second {
 		t.Errorf("mongo timeouts = %s/%s, want 10s/5s", cfg.MongoConnectTimeout, cfg.MongoPingTimeout)
 	}
-	if cfg.RedisPingTimeout != 3*time.Second {
-		t.Errorf("RedisPingTimeout = %s, want 3s", cfg.RedisPingTimeout)
-	}
 	if cfg.HealthCheckTimeout != 2*time.Second {
 		t.Errorf("HealthCheckTimeout = %s, want 2s", cfg.HealthCheckTimeout)
+	}
+	// Redis is gone, so the claim parameters are what a fresh deployment must
+	// get right instead: a positive poll gap, and headroom on the lease.
+	if cfg.WorkerClaimPollGap != 250*time.Millisecond {
+		t.Errorf("WorkerClaimPollGap = %s, want 250ms", cfg.WorkerClaimPollGap)
+	}
+	if cfg.ClaimLeaseHeadroom != 30*time.Second {
+		t.Errorf("ClaimLeaseHeadroom = %s, want 30s", cfg.ClaimLeaseHeadroom)
 	}
 }
 
@@ -60,7 +62,8 @@ func TestLoadReadsOverrides(t *testing.T) {
 	clearEnv(t)
 	t.Setenv("HTTP_ADDR", "127.0.0.1:9999")
 	t.Setenv("MONGODB_DATABASE", "cyberguard_test")
-	t.Setenv("REDIS_DB", "3")
+	t.Setenv("WORKER_CLAIM_POLL_GAP", "750ms")
+	t.Setenv("CLAIM_LEASE_HEADROOM", "90s")
 	t.Setenv("SHUTDOWN_TIMEOUT", "45s")
 	t.Setenv("URL_FINGERPRINT_HMAC_KEY", "  hexkey  ")
 	t.Setenv("HYBRID_ANALYSIS_API_KEY", "notarealkey")
@@ -76,8 +79,11 @@ func TestLoadReadsOverrides(t *testing.T) {
 	if cfg.MongoDatabase != "cyberguard_test" {
 		t.Errorf("MongoDatabase = %q", cfg.MongoDatabase)
 	}
-	if cfg.RedisDB != 3 {
-		t.Errorf("RedisDB = %d, want 3", cfg.RedisDB)
+	if cfg.WorkerClaimPollGap != 750*time.Millisecond {
+		t.Errorf("WorkerClaimPollGap = %s, want 750ms", cfg.WorkerClaimPollGap)
+	}
+	if cfg.ClaimLeaseHeadroom != 90*time.Second {
+		t.Errorf("ClaimLeaseHeadroom = %s, want 90s", cfg.ClaimLeaseHeadroom)
 	}
 	if cfg.ShutdownTimeout != 45*time.Second {
 		t.Errorf("ShutdownTimeout = %s, want 45s", cfg.ShutdownTimeout)
@@ -92,18 +98,35 @@ func TestLoadReadsOverrides(t *testing.T) {
 	}
 }
 
+// A lease that does not outlive the work it protects would let a second
+// consumer claim a scan whose provider analysis is still running — which on the
+// submission path is a double submission and a double charge. The headroom is
+// therefore rejected at load rather than at the point where it costs money.
+func TestLoadRejectsAClaimLeaseThatCouldExpireMidScan(t *testing.T) {
+	clearEnv(t)
+	t.Setenv("CLAIM_LEASE_HEADROOM", "0s")
+
+	_, err := Load()
+	if err == nil {
+		t.Fatal("a zero lease headroom was accepted")
+	}
+	if !strings.Contains(err.Error(), "CLAIM_LEASE_HEADROOM") {
+		t.Errorf("error = %v, want it to name CLAIM_LEASE_HEADROOM", err)
+	}
+}
+
 func TestLoadRejectsUnusableValues(t *testing.T) {
 	cases := []struct{ name, key, value, wantErr string }{
 		{"bad log format", "LOG_FORMAT", "xml", "LOG_FORMAT"},
 		{"bad log level", "LOG_LEVEL", "verbose", "LOG_LEVEL"},
 		{"negative shutdown", "SHUTDOWN_TIMEOUT", "-1s", "SHUTDOWN_TIMEOUT"},
 		{"bad duration", "SHUTDOWN_TIMEOUT", "soon", "SHUTDOWN_TIMEOUT"},
-		{"negative redis db", "REDIS_DB", "-1", "REDIS_DB"},
-		{"non-numeric redis db", "REDIS_DB", "main", "REDIS_DB"},
 		{"non-positive health timeout", "HEALTH_CHECK_TIMEOUT", "0s", "HEALTH_CHECK_TIMEOUT"},
 		{"bad mongo connect timeout", "MONGODB_CONNECT_TIMEOUT", "later", "MONGODB_CONNECT_TIMEOUT"},
 		{"bad mongo ping timeout", "MONGODB_PING_TIMEOUT", "1", "MONGODB_PING_TIMEOUT"},
-		{"bad redis ping timeout", "REDIS_PING_TIMEOUT", "-", "REDIS_PING_TIMEOUT"},
+		{"non-positive claim poll gap", "WORKER_CLAIM_POLL_GAP", "0s", "WORKER_CLAIM_POLL_GAP"},
+		{"bad claim poll gap", "WORKER_CLAIM_POLL_GAP", "often", "WORKER_CLAIM_POLL_GAP"},
+		{"negative lease headroom", "CLAIM_LEASE_HEADROOM", "-1s", "CLAIM_LEASE_HEADROOM"},
 		{"bad health timeout", "HEALTH_CHECK_TIMEOUT", "nope", "HEALTH_CHECK_TIMEOUT"},
 	}
 
@@ -133,7 +156,8 @@ func TestLoadRejectsUnusableValues(t *testing.T) {
 // changed to empty.
 func TestWhitespaceValuesFallBackToDefaults(t *testing.T) {
 	clearEnv(t)
-	for _, key := range []string{"HTTP_ADDR", "MONGODB_URI", "MONGODB_DATABASE", "REDIS_ADDR"} {
+	for _, key := range []string{"HTTP_ADDR", "MONGODB_URI", "MONGODB_DATABASE",
+		"WORKER_CLAIM_POLL_GAP", "CLAIM_LEASE_HEADROOM"} {
 		t.Setenv(key, "   \t ")
 	}
 
@@ -141,7 +165,10 @@ func TestWhitespaceValuesFallBackToDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load with whitespace-only values: %v", err)
 	}
-	if cfg.HTTPAddr != ":8080" || cfg.MongoDatabase != "cyberguard" || cfg.RedisAddr != "redis:6379" {
+	if cfg.HTTPAddr != ":8080" || cfg.MongoDatabase != "cyberguard" {
+		t.Errorf("whitespace did not fall back to defaults: %+v", cfg)
+	}
+	if cfg.WorkerClaimPollGap != 250*time.Millisecond || cfg.ClaimLeaseHeadroom != 30*time.Second {
 		t.Errorf("whitespace did not fall back to defaults: %+v", cfg)
 	}
 }

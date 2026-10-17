@@ -455,16 +455,16 @@ func TestConcurrentSubmissionsProduceOneScan(t *testing.T) {
 
 // ------------------------------------------------- queue failure recovery
 
-// MongoDB records the scan, Redis refuses the enqueue. The submission is still
+// MongoDB records the scan, making it claimable then fails. The submission is still
 // accepted and the reconciler delivers it: a delivery failure is a delay, never
 // a lost scan.
 func TestEnqueueFailureIsRecoveredByTheReconciler(t *testing.T) {
 	t.Parallel()
 
 	h := newHarness(t, harnessOptions{})
-	h.queue.FailEnqueue = errors.New("redis: connection refused")
+	h.queue.FailEnqueue = errors.New("enqueue unavailable")
 
-	outcome, err := h.svc.Submit(t.Context(), "https://example.test/redis-down")
+	outcome, err := h.svc.Submit(t.Context(), "https://example.test/enqueue-down")
 	if err != nil {
 		t.Fatalf("Submit must still succeed when the enqueue fails: %v", err)
 	}
@@ -830,6 +830,64 @@ func TestRestartResumesPollingWithoutResubmitting(t *testing.T) {
 	}
 	if got := h.scan(t, outcome.Scan.ScanID).Status; got != mongostore.ScanCompleted {
 		t.Errorf("status = %q, want completed", got)
+	}
+}
+
+// The assessment must carry the provider job id on the path where the
+// submission happens in this same process — the common case.
+//
+// submit() persists the handle to the store, then continues with its in-memory
+// copy of the scan, and complete() builds the assessment from that copy. Before
+// the identifiers were mirrored onto it, the store held the job id while the
+// in-memory scan did not, so every first-attempt scan wrote an assessment with
+// an empty provider_scan_id. Only a resumed scan carried one, because only a
+// resumed scan re-reads the document that already had it — which is why the
+// restart path was green and the ordinary path was not.
+func TestAssessmentCarriesTheProviderIdentifiersFromAFirstAttemptSubmission(t *testing.T) {
+	t.Parallel()
+
+	h := newHarness(t, harnessOptions{
+		fastPoll: true,
+		submit: func(context.Context, string) (providers.Submission, error) {
+			env := 140
+			return providers.Submission{
+				ProviderScanID:       "job-live-1",
+				ProviderSubmissionID: "sub-live-1",
+				EnvironmentID:        &env,
+				State:                providers.StateQueued,
+			}, nil
+		},
+		analysis: func(_ context.Context, id string) (providers.Analysis, error) {
+			if id != "job-live-1" {
+				t.Errorf("polled %q, want job-live-1", id)
+			}
+			return providers.Analysis{
+				Finished:       true,
+				Classification: "no specific threat",
+				ProviderState:  "SUCCESS",
+				ReportedAt:     time.Now().UTC(),
+			}, nil
+		},
+	})
+
+	outcome := h.submitAndRun(t, "https://example.test/first-attempt")
+
+	a, err := h.store.GetAssessmentByScanID(t.Context(), outcome.Scan.ScanID)
+	if err != nil {
+		t.Fatalf("no assessment was written for a completed analysis: %v", err)
+	}
+
+	// The provider name is whatever the harness provider calls itself; the
+	// production value is asserted in the integration test.
+	if want := h.provider.Name(); a.Provider != want {
+		t.Errorf("assessment provider = %q, want %q", a.Provider, want)
+	}
+	if a.ProviderScanID != "job-live-1" {
+		t.Errorf("assessment provider_scan_id = %q, want job-live-1: the audit trail "+
+			"must name the provider job that produced the verdict", a.ProviderScanID)
+	}
+	if a.Verdict != verdicts.NoThreatDetected {
+		t.Errorf("verdict = %q, want no_threat_detected", a.Verdict)
 	}
 }
 

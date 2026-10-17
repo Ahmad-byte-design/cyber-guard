@@ -68,8 +68,21 @@ type Rule struct {
 }
 
 // Action is the published action shape.
+//
+// Redirect is present only for a redirect rule. Chrome rejects a block action
+// carrying a redirect, so the field is omitted rather than sent as null.
 type Action struct {
-	Type string `json:"type"`
+	Type     string    `json:"type"`
+	Redirect *Redirect `json:"redirect,omitempty"`
+}
+
+// Redirect describes the destination of a redirect rule.
+//
+// Only ExtensionPath is modelled. Chrome also allows `url` and `transform`;
+// both would send a user's browser somewhere chosen by an assessment, so this
+// engine cannot emit them and does not carry them.
+type Redirect struct {
+	ExtensionPath string `json:"extensionPath"`
 }
 
 // Condition is the published condition shape.
@@ -178,7 +191,21 @@ func snapshotFrom(rs mongostore.Ruleset) Snapshot {
 				RegexFilter: r.Condition.Filter.RegexFilter,
 			}
 		}
+		// The redirect member is carried only when the stored rule has one, so a
+		// block rule never publishes an empty `redirect` object.
+		//
+		// Losing it would not be cosmetic: a client that sees `{"type":"redirect"}`
+		// with no destination has no way to act on the rule at all.
+		if r.Action.Redirect != nil && r.Action.Redirect.ExtensionPath != "" {
+			rule.Action.Redirect = &Redirect{ExtensionPath: r.Action.Redirect.ExtensionPath}
+		}
 		rule.Condition.ResourceTypes = append([]string(nil), r.Condition.ResourceTypes...)
+		if len(rule.Condition.ResourceTypes) == 0 {
+			// Never publish an empty list. An absent list means "every type
+			// except main_frame" to Chrome, which would silently stop the rule
+			// blocking navigation.
+			rule.Condition.ResourceTypes = []string{"main_frame"}
+		}
 		out.Rules = append(out.Rules, rule)
 	}
 	return out
@@ -203,6 +230,7 @@ func toCandidates(assessments []mongostore.Assessment) []rulesets.Candidate {
 			RegistrableDomain: a.RegistrableDomain,
 			Verdict:           a.Verdict,
 			Scheme:            a.Scheme,
+			Port:              a.Port,
 			PathPrefix:        a.PathPrefix,
 			AnalyzedAt:        a.AnalyzedAt,
 			ExpiresAt:         a.ExpiresAt,
@@ -222,10 +250,10 @@ func toStoredRules(rules []rulesets.Rule) []mongostore.Rule {
 		stored := mongostore.Rule{
 			ID:       r.ID,
 			Priority: r.Priority,
-			Action:   mongostore.RuleAction{Type: r.Action.Type},
+			Action:   mongostore.RuleAction{Type: r.Action.Type.String()},
 			Condition: mongostore.RuleCondition{
 				URLFilter:     r.Condition.URLFilter,
-				ResourceTypes: append([]string(nil), r.Condition.ResourceTypes...),
+				ResourceTypes: rulesets.ResourceTypesToStrings(r.Condition.ResourceTypes),
 			},
 			Provenance: mongostore.RuleProvenance{
 				Fingerprint:       r.Provenance.Fingerprint,
@@ -240,6 +268,12 @@ func toStoredRules(rules []rulesets.Rule) []mongostore.Rule {
 				RegexFilter: r.Condition.Filter.RegexFilter,
 			}
 		}
+		if r.Action.Redirect != nil {
+			stored.Action.Redirect = &mongostore.Redirect{
+				ExtensionPath: r.Action.Redirect.ExtensionPath,
+			}
+		}
+		stored.Provenance.Action = r.Provenance.Action.String()
 		out = append(out, stored)
 	}
 	return out

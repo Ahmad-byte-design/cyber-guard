@@ -649,8 +649,12 @@ func TestParseScopeRejectsUnknownValues(t *testing.T) {
 
 // ------------------------------------------------------------- escaping
 
-// A path containing a urlFilter operator must not be able to widen the rule.
-func TestPathOperatorsAreEscaped(t *testing.T) {
+// A path containing a urlFilter operator must never widen a rule.
+//
+// There is no documented escape for these characters, so an older version of
+// this engine emitted a backslash and hoped. The rule now rejects the candidate
+// instead, which is the only behaviour that can be proved correct.
+func TestUnsafeFilterLiteralsAreRejectedNotEscaped(t *testing.T) {
 	t.Parallel()
 
 	policy := DefaultPolicy()
@@ -661,23 +665,65 @@ func TestPathOperatorsAreEscaped(t *testing.T) {
 		"fp1": {HostFingerprints: 5, PrefixFingerprints: 5},
 	}})
 
+	// Each of these is an operator in the documented urlFilter grammar, or a
+	// character that cannot appear literally in a matched URL.
+	for _, path := range []string{
+		"/a|*other.test^", // would OR in an unrelated host
+		"/a*b",            // wildcard
+		"/a,b",
+		"/a:b",
+		"/a^b",
+		"/\u00fcber", // non-ASCII: never appears literally in a URL
+	} {
+		t.Run(path, func(t *testing.T) {
+			_, err := g.Generate(t.Context(), []Candidate{
+				{
+					Fingerprint: "fp1", Hostname: "evil.test", RegistrableDomain: "evil.test",
+					Verdict: verdicts.Malicious, Scheme: "https",
+					PathPrefix: path,
+					AnalyzedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour),
+				},
+			}, testNow)
+
+			if err == nil {
+				t.Fatal("Generate accepted a path containing a filter operator; " +
+					"it must be rejected rather than escaped into an unverifiable pattern")
+			}
+			if !errors.Is(err, ErrInvalidRule) {
+				t.Errorf("error = %v, want ErrInvalidRule", err)
+			}
+		})
+	}
+}
+
+// The same path is expressible at exact-URL scope, where RE2 escaping is well
+// defined. A candidate is rejected only where it cannot be represented safely.
+func TestFilterOperatorPathIsFineAtExactURLScope(t *testing.T) {
+	t.Parallel()
+
+	g := newGen(t, DefaultPolicy(), fixedEvidence{counts: map[string]Corroboration{
+		"fp1": {HostFingerprints: 5, PrefixFingerprints: 5, DomainFingerprints: 5},
+	}})
+
 	snap, err := g.Generate(t.Context(), []Candidate{
 		{
 			Fingerprint: "fp1", Hostname: "evil.test", RegistrableDomain: "evil.test",
 			Verdict: verdicts.Malicious, Scheme: "https",
-			// A pipe is an OR operator in urlFilter syntax; unescaped it would
-			// match an unrelated host entirely.
-			PathPrefix: "/a|*other.test^",
+			PathPrefix: "/a*b",
 			AnalyzedAt: testNow.Add(-time.Hour), ExpiresAt: testNow.Add(time.Hour),
 		},
 	}, testNow)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
+	if len(snap.Rules) != 1 {
+		t.Fatalf("got %d rules, want 1", len(snap.Rules))
+	}
 
-	filter := snap.Rules[0].Condition.URLFilter
-	if !strings.Contains(filter, `\|`) {
-		t.Errorf("filter %q did not escape the pipe; it could match another host", filter)
+	// The star must be escaped so it cannot act as a wildcard.
+	re := snap.Rules[0].Condition.Filter.RegexFilter
+	if !strings.Contains(re, `\*`) {
+		t.Errorf("regexFilter %q does not escape the star; it would match any character", re)
 	}
 }
 

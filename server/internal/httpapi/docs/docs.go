@@ -92,6 +92,11 @@ var permittedAssets = map[string]string{
 // It is populated once in init and only read afterwards, so it needs no lock.
 var loaded map[string]staticAsset
 
+// vendoredVersion is the Swagger UI release recorded in assets/VERSION.
+//
+// It is populated once in init and only read afterwards, so it needs no lock.
+var vendoredVersion string
+
 // init loads the embedded assets.
 //
 // Failing here is deliberate. A missing or empty asset would otherwise produce
@@ -112,8 +117,22 @@ func init() {
 		loaded[name] = staticAsset{
 			body:        body,
 			contentType: contentType,
-			etag:        weakETag(body),
+			etag:        etagFor(body),
 		}
+	}
+
+	// VERSION is held to the same standard as the assets, for the same reason.
+	// It is rendered onto the page, so a missing or blank file would not fail
+	// visibly: the page would simply read "Swagger UI  is vendored into this
+	// binary" and the operator would have no way to tell a deployment with no
+	// recorded release from one that never recorded one on purpose.
+	raw, err := assets.ReadFile("assets/VERSION")
+	if err != nil {
+		panic(fmt.Sprintf("docs: the vendored version is missing: %v", err))
+	}
+	vendoredVersion = strings.TrimSpace(string(raw))
+	if vendoredVersion == "" {
+		panic("docs: assets/VERSION is empty")
 	}
 }
 
@@ -122,13 +141,10 @@ func init() {
 // It is surfaced on the served page, so an operator reading the page can tell
 // which release their deployment runs — the first question asked when a
 // documentation page misbehaves.
-func Version() string {
-	v, err := assets.ReadFile("assets/VERSION")
-	if err != nil {
-		return "unknown"
-	}
-	return strings.TrimSpace(string(v))
-}
+//
+// It cannot return an empty string or a placeholder: init refuses to start
+// without a usable VERSION.
+func Version() string { return vendoredVersion }
 
 // ------------------------------------------------------------------ assets
 
@@ -184,7 +200,7 @@ func AssetHandler(name string, notFound func(http.ResponseWriter, *http.Request)
 // request arrives.
 func SpecHandler() http.Handler {
 	body := contract.OpenAPISpec
-	etag := weakETag(body)
+	etag := etagFor(body)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", etag)
@@ -240,8 +256,10 @@ var indexTemplate = template.Must(template.New("docs").Parse(`<!DOCTYPE html>
   <p class="cg-note">
     The live contract, served by this same process at <code>{{.SpecURL}}</code>.
     Requests from <em>Try it out</em> go to the server selected in the dropdown;
-    the default is the documented local deployment. Swagger UI is vendored — no
-    external network access is used to render this page.
+    the default is the documented local deployment.
+
+    Swagger UI {{.Version}} is vendored into this binary: no external network
+    access is used to render this page.
   </p>
   <div id="swagger-ui"></div>
 
@@ -285,7 +303,13 @@ func UIHandler() http.Handler {
 		Title     string
 		AssetBase string
 		SpecURL   string
-	}{Title: pageTitle, AssetBase: "assets/", SpecURL: "../openapi.yaml"})
+		Version   string
+	}{
+		Title:     pageTitle,
+		AssetBase: "assets/",
+		SpecURL:   "../openapi.yaml",
+		Version:   Version(),
+	})
 	if err != nil {
 		// The template is a constant with constant data, so this cannot vary
 		// at runtime. A failure is a build defect, and must not degrade into a
@@ -295,7 +319,7 @@ func UIHandler() http.Handler {
 	page := buf.Bytes()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("ETag", weakETag(page))
+		w.Header().Set("ETag", etagFor(page))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		// The page is same-origin with the API it documents and loads no
@@ -320,12 +344,17 @@ func UIHandler() http.Handler {
 
 // ------------------------------------------------------------------ helpers
 
-// weakETag derives a strong entity tag from content.
+// etagFor derives a strong entity tag from content.
 //
-// The digest is truncated: this is an HTTP change detector, not an integrity
-// check, and 8 bytes is far beyond any realistic chance of collision for a
-// handful of documents.
-func weakETag(body []byte) string {
+// Strong, because the bytes are byte-identical: the tag carries no `W/` prefix.
+// It is computed from a digest rather than a timestamp for the same reason, so
+// rebuilding the same binary yields the same tag and a client's cached copy
+// survives a restart.
+//
+// The digest is truncated to 8 bytes. This is an HTTP change detector, not an
+// integrity check, and 8 bytes is far beyond any realistic chance of collision
+// across a handful of documents.
+func etagFor(body []byte) string {
 	sum := sha256.Sum256(body)
 	return `"` + hex.EncodeToString(sum[:8]) + `"`
 }

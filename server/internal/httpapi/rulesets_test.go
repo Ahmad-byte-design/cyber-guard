@@ -426,3 +426,185 @@ func TestRulesetNeverCarriesURLs(t *testing.T) {
 		}
 	}
 }
+
+// ------------------------------------------------- published DNR conformance
+
+// The response must decode into the DNR structure the contract specifies, with
+// no MongoDB document leaking through and no provenance attached.
+//
+// Provenance in particular is the thing most likely to leak: it is stored with
+// each rule and Chrome rejects unknown members inside a Rule, so emitting it
+// would break the ruleset on the client's machine.
+func TestPublishedRuleDecodesIntoTheDNRStructure(t *testing.T) {
+	t.Parallel()
+
+	rs := sampleSnapshot(1, 1)
+	rs.Rules[0].Provenance = mongostore.RuleProvenance{
+		Fingerprint: "abc123", Scope: "exact_url", Corroboration: 5, Action: "block",
+	}
+
+	rec := get(t, newRulesetServer(t, &stubRulesetStore{current: rs}), "/api/v1/get-all", nil)
+
+	var envelope struct {
+		Version int64 `json:"version"`
+		Rules   []struct {
+			ID       int `json:"id"`
+			Priority int `json:"priority"`
+			Action   struct {
+				Type     string `json:"type"`
+				Redirect *struct {
+					ExtensionPath string `json:"extensionPath"`
+				} `json:"redirect"`
+			} `json:"action"`
+			Condition struct {
+				URLFilter string `json:"urlFilter"`
+				Filter    *struct {
+					Type        string `json:"type"`
+					RegexFilter string `json:"regexFilter"`
+				} `json:"filter"`
+				ResourceTypes []string `json:"resourceTypes"`
+			} `json:"condition"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("the response does not decode into the DNR structure: %v", err)
+	}
+
+	if len(envelope.Rules) != 1 {
+		t.Fatalf("got %d rules, want 1", len(envelope.Rules))
+	}
+	r := envelope.Rules[0]
+	if r.ID < 1 || r.Priority < 1 {
+		t.Errorf("id = %d, priority = %d; both must be >= 1", r.ID, r.Priority)
+	}
+	if r.Action.Type != "block" {
+		t.Errorf("action.type = %q, want block", r.Action.Type)
+	}
+	if r.Action.Redirect != nil {
+		t.Error("a block rule was published with a redirect member")
+	}
+	if len(r.Condition.ResourceTypes) == 0 {
+		t.Error("resourceTypes is empty; Chrome would treat an absent list as excluding main_frame")
+	}
+
+	// No internal document key may reach the client.
+	body := rec.Body.String()
+	for _, leak := range []string{"provenance", "fingerprint", "corroboration", "bson", "_id"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("the response leaks %q: %s", leak, body)
+		}
+	}
+}
+
+// A redirect rule must publish the extensionPath, and the extension page must be
+// an extension-relative path.
+func TestPublishedRedirectCarriesTheExtensionPath(t *testing.T) {
+	t.Parallel()
+
+	rs := sampleSnapshot(3, 1)
+	rs.Rules[0].Action = mongostore.RuleAction{
+		Type:     "redirect",
+		Redirect: &mongostore.Redirect{ExtensionPath: "/locked.html"},
+	}
+	rs.Rules[0].Condition.ResourceTypes = []string{"main_frame", "sub_frame"}
+
+	rec := get(t, newRulesetServer(t, &stubRulesetStore{current: rs}), "/api/v1/get-all", nil)
+
+	var envelope struct {
+		Rules []struct {
+			Action struct {
+				Type     string `json:"type"`
+				Redirect *struct {
+					ExtensionPath string `json:"extensionPath"`
+				} `json:"redirect"`
+			} `json:"action"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(envelope.Rules) != 1 {
+		t.Fatalf("got %d rules, want 1", len(envelope.Rules))
+	}
+
+	got := envelope.Rules[0].Action
+	if got.Type != "redirect" {
+		t.Errorf("action.type = %q, want redirect", got.Type)
+	}
+	if got.Redirect == nil {
+		t.Fatal("a redirect rule was published without a redirect member")
+	}
+	if got.Redirect.ExtensionPath != "/locked.html" {
+		t.Errorf("extensionPath = %q, want /locked.html", got.Redirect.ExtensionPath)
+	}
+	if !strings.HasPrefix(got.Redirect.ExtensionPath, "/") {
+		t.Error("extensionPath is not extension-relative")
+	}
+}
+
+// The rules property must always be an array, never null, because a client
+// decoding into []Rule would treat the two differently.
+func TestPublishedRulesAreAlwaysAnArray(t *testing.T) {
+	t.Parallel()
+
+	for _, current := range []mongostore.Ruleset{
+		{Version: 1, GeneratedAt: time.Now().UTC(), Rules: nil},
+		{Version: 2, GeneratedAt: time.Now().UTC(), Rules: []mongostore.Rule{}},
+	} {
+		rec := get(t, newRulesetServer(t, &stubRulesetStore{current: current}), "/api/v1/get-all", nil)
+
+		var envelope struct {
+			Rules []json.RawMessage `json:"rules"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if envelope.Rules == nil {
+			t.Errorf("version %d published rules as null, want []", current.Version)
+		}
+		if !strings.Contains(rec.Body.String(), `"rules":[`) {
+			t.Errorf("version %d did not publish an array: %s", current.Version, rec.Body.String())
+		}
+	}
+}
+
+// A stored rule with no resourceTypes must still publish a list.
+//
+// Chrome's default for an absent list excludes main_frame, so a rule published
+// without one would silently stop blocking navigation — the opposite of what it
+// was generated for.
+func TestPublishedRuleNeverOmitsResourceTypes(t *testing.T) {
+	t.Parallel()
+
+	rs := sampleSnapshot(1, 1)
+	rs.Rules[0].Condition.ResourceTypes = nil
+
+	rec := get(t, newRulesetServer(t, &stubRulesetStore{current: rs}), "/api/v1/get-all", nil)
+
+	var envelope struct {
+		Rules []struct {
+			Condition struct {
+				ResourceTypes []string `json:"resourceTypes"`
+			} `json:"condition"`
+		} `json:"rules"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(envelope.Rules) != 1 {
+		t.Fatalf("got %d rules, want 1", len(envelope.Rules))
+	}
+	types := envelope.Rules[0].Condition.ResourceTypes
+	if len(types) == 0 {
+		t.Fatal("resourceTypes was omitted; the rule would not block navigation")
+	}
+	var hasMain bool
+	for _, rt := range types {
+		if rt == "main_frame" {
+			hasMain = true
+		}
+	}
+	if !hasMain {
+		t.Errorf("resourceTypes = %v with no main_frame", types)
+	}
+}

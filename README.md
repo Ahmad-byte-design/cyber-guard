@@ -29,10 +29,15 @@ This README covers only how to run the service.
 | [`decisions/`](docs/decisions/) | Architecture decision records |
 
 > **Status: end-to-end scan workflow implemented.** `POST /api/v1/check-url`
-> accepts a URL, deduplicates it, encrypts it, queues it; the worker submits it
-> to the provider, polls, normalises the result and caches the verdict; `GET
-> /api/v1/get-url/{scanId}` serves the outcome. Verified end to end against live
-> MongoDB and Redis with a **mock** provider.
+> accepts a URL, deduplicates it, encrypts it and leaves it claimable; the scan
+> runner claims it, submits it to the provider, polls, normalises the result and
+> caches the verdict; `GET /api/v1/get-url/{scanId}` serves the outcome.
+> Verified end to end against live MongoDB with a **mock** provider.
+>
+> The runner is goroutines inside the API process and the `scans` collection is
+> the queue, so the deployment is **one application process plus MongoDB**. There
+> is no separate worker binary and no Redis. `POST /api/v1/check-url` still
+> returns **202** and never waits for an analysis to finish.
 >
 > **The Hybrid Analysis adapter has never been called against the live API.**
 > Its contract was verified against the published OpenAPI document and every
@@ -49,9 +54,14 @@ toolchain install is needed on the host.
 docker compose up -d --build
 ```
 
-That is the whole thing. `ANALYSIS_PROVIDER=mock` is the default, so **no
+That is the whole thing. Docker Compose sets `ANALYSIS_PROVIDER=mock`, so **no
 Hybrid Analysis account, no API key and no external request is involved**. The
 API is on <http://localhost:8080>.
+
+> The *binary's* own default is `hybrid-analysis`, which requires an API key and
+> fails fast without one. That is deliberate — a server should not silently
+> pretend to be analysing URLs when it is not — so a binary run outside Compose
+> needs `ANALYSIS_PROVIDER=mock` set explicitly.
 
 ```sh
 curl localhost:8080/health/live          # {"status":"ok"}
@@ -71,7 +81,9 @@ need no secret:
 Swagger UI is **vendored into the binary** at a pinned version
 (`server/internal/httpapi/docs/assets/`, Apache-2.0). No CDN is used at runtime,
 so the page renders with no internet access — including inside an air-gapped
-deployment, which is when an operator is most likely to want it.
+deployment, which is when an operator is most likely to want it. The page prints
+the pinned release it was built with, so you can tell what you are reading
+without leaving the browser.
 
 To switch it off — the API is unaffected either way:
 
@@ -100,7 +112,10 @@ With the stack running:
 6. Expand `GET /api/v1/get-url/{scanId}`, paste the `scan_id` into `scanId`,
    click **Try it out** then **Execute**. Repeat every couple of seconds until
    `status` is `completed`, `failed` or `timed_out`.
-7. `GET /api/v1/get-all` returns the browser protection ruleset.
+7. If you lost the `scan_id`, `POST /api/v1/get-url` takes `{"url": "..."}` and
+   returns the same result for the URL's most recent scan. It is a POST because
+   a URL in a path would land in every access log between here and the server.
+8. `GET /api/v1/get-all` returns the browser protection ruleset.
 
 The same two calls with curl:
 
@@ -110,8 +125,11 @@ SCAN=$(curl -sS -X POST localhost:8080/api/v1/check-url \
   -H 'Content-Type: application/json' \
   -d '{"url":"https://example.test/login"}' | sed -E 's/.*"scan_id":"([^"]+)".*/\1/')
 
-# 2. Poll.
+# 2. Poll. The same poll by URL, for a client that lost the scan ID.
 curl -sS "localhost:8080/api/v1/get-url/$SCAN"
+curl -sS -X POST localhost:8080/api/v1/get-url \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.test/login"}'    # 404 if never scanned
 
 # 3. The ruleset.
 curl -sS localhost:8080/api/v1/get-all
@@ -164,9 +182,9 @@ start: scans that have not been submitted yet could no longer be decrypted.
 
 ### Mock mode (the default)
 
-`ANALYSIS_PROVIDER=mock` analyses URLs **inside the worker process**. Nothing
-leaves your machine, results are deterministic (the same URL always gives the
-same verdict), and no API key is needed.
+`ANALYSIS_PROVIDER=mock` analyses URLs **inside the API process**, on the scan
+runner's own goroutines. Nothing leaves your machine, results are deterministic
+(the same URL always gives the same verdict), and no API key is needed.
 
 The verdict depends on a keyword in the URL, so every branch can be tried:
 
@@ -185,10 +203,11 @@ integration would rot while its tests still passed.
 
 ### Schema migration
 
-`docker compose up` runs a one-shot `migrate` service first, and the API and
-worker wait for it to succeed. It creates the indexes the system depends on —
+`docker compose up` runs a one-shot `migrate` service first, and the API
+waits for it to succeed. It creates the indexes the system depends on —
 most importantly the partial unique index that makes "one provider submission
-per URL" actually true.
+per URL" actually true, and `by_claimable` on `scans`, which is what makes a
+queued scan findable by the runner.
 
 Run it by hand any time:
 
@@ -272,37 +291,36 @@ Branch on `code`, never on `detail`.
 | Build a binary | `docker compose run --rm go go build -o bin/api ./cmd/api` |
 | Check the version stamp | `docker compose exec backend cyberguard-api -version` |
 
-Integration tests need the datastores running, and work **with the application
-running too** — they use their own MongoDB databases and their own Redis logical
-databases, so they never disturb a live deployment:
+Integration tests need MongoDB running, and work **with the application
+running too** — they use their own MongoDB database, so they never disturb a
+live deployment:
 
 ```sh
-docker compose up -d mongodb redis
+docker compose up -d mongodb
 docker compose run --rm go go test -tags integration ./...
 ```
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `REDIS_TEST_DB_QUEUE` | `1` | Redis database for queue tests |
-| `REDIS_TEST_DB_LIMIT` | `2` | Redis database for rate-limit tests |
-| `REDIS_TEST_DB_SCAN` | `3` | Redis database for end-to-end tests |
+| `MONGODB_URI` | `mongodb://mongodb:27017` | datastore the tests connect to |
+| `MONGODB_DATABASE` | `cyberguard_integration` | database the tests create and drop |
 
-The application itself uses `REDIS_DB`, which defaults to `0`.
+Rate-limit tests are **not** in that set: the counters are in-process, so they
+are ordinary unit tests and need no datastore at all.
 
 ## Services
 
 | Service | Image | Published | Purpose |
 |---|---|---|---|
-| `backend` | built from `server/` | `8080` | JSON API |
-| `worker` | same image, different entrypoint | none | consumes the queue, submits and polls |
+| `backend` | built from `server/` | `8080` | JSON API **and** the scan runner |
 | `migrate` | same image, different entrypoint | none | one-shot: creates indexes, then exits |
-| `mongodb` | `mongo:9.0` | none | authoritative store |
-| `redis` | `redis:8-alpine` | none | job queue + rate-limit counters |
+| `mongodb` | `mongo:9.0` | none | authoritative store **and work queue** |
 | `go` | `golang:1.27-alpine` | none | dev toolchain for build/test |
 
-MongoDB and Redis publish **no host ports**; containers reach them as
-`mongodb:27017` and `redis:6379` on the Compose network, per §11.11 of the
-architecture doc. Publish them yourself only if you need a local client.
+MongoDB publishes **no host ports**; containers reach it as `mongodb:27017` on
+the Compose network, per §11.11 of the architecture doc. Publish it yourself
+only if you need a local client. It is the only datastore, so `docker compose up`
+starts two long-running services.
 
 MongoDB is pinned to 9.x on purpose: 8.0 refuses to start on Linux kernel
 6.19+ ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)), which
@@ -320,7 +338,15 @@ the full list. The ones that matter most:
   disabled and readiness reports it as a degraded sub-check, not a failure.
 - `MONGODB_URI` / `MONGODB_DATABASE` / `MONGODB_CONNECT_TIMEOUT` /
   `MONGODB_PING_TIMEOUT`
-- `REDIS_ADDR` / `REDIS_PASSWORD` / `REDIS_DB` / `REDIS_PING_TIMEOUT`
+- `WORKER_CLAIM_POLL_GAP` (default `250ms`) — how hard an idle runner queries
+  MongoDB for work. MongoDB has no blocking claim primitive, so an idle consumer
+  polls; this bounds how fast.
+- `CLAIM_LEASE_HEADROOM` (default `30s`) — the claim lease is **derived**, not
+  set directly: `WORKER_POLL_DEADLINE + WORKER_POLL_INTERVAL + CLAIM_LEASE_HEADROOM`.
+  The lease must outlive the longest possible unit of work, or a second claim
+  could land on a scan whose provider analysis is still running — and on the
+  submission path that means submitting the URL twice. A headroom of `<= 0` is
+  rejected at config load rather than accepted and left to fail in production.
 - `HEALTH_CHECK_TIMEOUT` — bounds each readiness probe.
 - `API_DOCS_ENABLED` — serves Swagger UI at `/docs/` and the contract at
   `/openapi.yaml`. Defaults to `true`; no secret is involved. Setting it to
@@ -335,10 +361,10 @@ become a different key on one replica than on another.
 ```
 server/
 ├── cmd/
-│   ├── api/                      # HTTP server entrypoint
-│   └── worker/                   # async worker entrypoint
+│   ├── api/                      # HTTP server entrypoint + the scan runner
+│   └── migrate/                  # one-shot index creation
 ├── internal/
-│   ├── app/                      # shared datastore wiring for both binaries
+│   ├── app/                      # shared datastore wiring
 │   ├── config/                   # env loading and validation
 │   ├── health/                   # readiness probes (Check interface + Checker)
 │   ├── httpapi/                  # routing, middleware, RFC 9457 handlers
@@ -346,7 +372,9 @@ server/
 │   ├── logging/                  # slog setup (JSON to stderr)
 │   ├── platform/
 │   │   ├── mongostore/           # MongoDB repositories + indexes + transient URL crypto
-│   │   └── redisqueue/           # Redis connection + health
+│   │   │                        # + the lease-based claim query
+│   │   └── mongoqueue/           # scans collection adapted to the delivery interface
+│   ├── ratelimit/                # in-process fixed-window counters
 │   ├── providers/                # provider contract (moves to scans in Phase 4)
 │   │   ├── hybridanalysis/       # real adapter — the only HA-aware package
 │   │   └── mock/                 # deterministic fake provider for tests
@@ -359,11 +387,13 @@ server/
 └── go.mod
 ```
 
-The module has three **runtime** third-party dependencies — the official
-MongoDB Go driver, `go-redis`, and `golang.org/x/net` for the Public Suffix List
-— and one **test-only** dependency, `gopkg.in/yaml.v3`, used by
+The module has two **runtime** third-party dependencies — the official
+MongoDB Go driver and `golang.org/x/net` for the Public Suffix List — and one
+**test-only** dependency, `gopkg.in/yaml.v3`, used by
 `internal/httpapi/openapi_test.go` to parse and check the contract. Nothing
-reaches the request path that is not there for the service itself.
+reaches the request path that is not there for the service itself. `go-redis`
+was removed with the worker; the lease-based claim lives in MongoDB, so the
+driver is now the only datastore dependency.
 
 `openapi.yaml` lives inside the module so that
 `internal/httpapi/openapi_test.go` can assert the router and the contract have
@@ -395,7 +425,7 @@ Implemented:
 - HTTP server with request-ID propagation, access logging, panic recovery,
   bounded body reads and graceful shutdown
 - `GET /health/live` (dependency-free) and `GET /health/ready` (config +
-  MongoDB + Redis probes)
+  MongoDB + provider probes, plus the fingerprint/encryption key checks)
 - MongoDB connection management with bounded timeouts, verified by ping, and
   idempotent disconnect
 - **MongoDB persistence (Phase 3)**: `scans`, `assessments` and `transient_urls`
@@ -404,15 +434,19 @@ Implemented:
   storage (AES-256-GCM, AAD-bound)
 - **Deduplication at the database level**: a partial unique index makes N
   concurrent requests for one URL produce exactly one provider submission
-- Redis connection management, likewise
+- **Lease-based claiming on MongoDB** — a single atomic `FindOneAndUpdate`
+  stamps `lease_owner`/`lease_expires_at` on a claimable scan, so several
+  replicas compete safely for the same work with nothing to coordinate
 - **RFC 9457** problem-detail error responses
 - **OpenAPI 3.1** contract with a CI-enforced drift check against the router
 - **End-to-end scan workflow** — submit, deduplicate, encrypt, queue, submit to
   the provider, poll, normalise, cache, serve
-- **Crash recovery** — MongoDB is the dispatch ledger, so a lost or failed
-  queue message delays work rather than losing it
-- **Abuse controls** — Redis fixed-window per-client and per-fingerprint limits,
-  failing closed when Redis is unreachable
+- **Crash recovery** — the scan document *is* the dispatch ledger, so a lost or
+  failed process delays work rather than losing it: the lease lapses and the
+  next claim picks the scan up
+- **Abuse controls** — in-process fixed-window per-client and per-fingerprint
+  limits, with the same `X-RateLimit-*` headers and the same fail-closed
+  contract as before
 - **Target gate** — loopback, private, link-local and reserved hosts are refused
   before anything is stored
 - `GET /api/v1/get-all` (empty version-0 snapshot — rulesets are not built)

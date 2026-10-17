@@ -12,7 +12,7 @@ import (
 //
 // # What this is for
 //
-// Running the whole system — HTTP API, MongoDB, Redis queue, worker, verdict —
+// Running the whole system — HTTP API, MongoDB, in-process scan runner, verdict —
 // on a machine with no provider account, and with an absolute guarantee that no
 // request leaves the process.
 //

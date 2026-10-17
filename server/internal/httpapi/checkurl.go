@@ -276,11 +276,12 @@ const rateScopeClient = "client"
 
 // allow evaluates one rate limit and writes the 429 if it is exceeded.
 //
-// When no limiter is configured — unit tests, and a process started without
-// Redis — the check is skipped rather than failing the request. That is safe
-// because the limiter is not the only control: deduplication is enforced in
-// MongoDB, and the fingerprint budget is enforced by the scan lifecycle. Where
-// Redis *is* configured, an outage fails closed inside the limiter itself.
+// When no limiter is configured — unit tests, mainly — the check is skipped
+// rather than failing the request. That is safe because the limiter is not the
+// only control: deduplication is enforced in MongoDB, and the fingerprint budget
+// is enforced by the scan lifecycle. A limiter that cannot evaluate its counters
+// at all still fails closed inside itself, so skipping is only ever a
+// configuration state, never a degraded one.
 func (s *Server) allow(w http.ResponseWriter, r *http.Request, scope string, limit int, window time.Duration) bool {
 	if s.limiter == nil || limit <= 0 {
 		return true

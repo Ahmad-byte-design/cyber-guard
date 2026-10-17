@@ -17,13 +17,15 @@ CyberGuard AI is an open-source URL threat-checking backend used by a browser ex
 - Go backend (no Laravel, no PHP backend).
 - Go HTTP API using `net/http`; `chi` is a candidate router, not a mandatory choice.
 - MongoDB using the official Go driver; verify Go and driver compatibility before pinning versions.
-- Redis and a Go queue library such as Asynq only if justified for asynchronous job handling; isolate the queue behind an internal interface.
+- Work delivery from the `scans` collection itself, claimed with a time-bounded lease. Keep the delivery interface internal so an implementation can be swapped.
 - Hybrid Analysis API v2 as the initial external analysis provider.
 - Docker Compose.
 - Browser extension using supported browser APIs such as Chrome `declarativeNetRequest`.
 - Elasticsearch is optional and must not be included in the MVP unless a concrete search/analytics requirement justifies it.
 
-Go is the API and worker/orchestration language. Hybrid Analysis remains the external sandbox. Do not claim that writing the HTTP client in Go speeds up the provider's remote analysis.
+Go is the API and orchestration language. Hybrid Analysis remains the external sandbox. Do not claim that writing the HTTP client in Go speeds up the provider's remote analysis.
+
+The backend is **one process**. It serves HTTP and runs the scan pipeline on its own goroutines. Do not reintroduce a separate worker binary or a broker datastore: the decoupling that matters is between the request and the analysis, not between two processes.
 
 ## Primary task
 
@@ -38,12 +40,12 @@ Inspect the existing repository before modifying files. Design the architecture 
 
 ### 2. Go modular architecture
 
-Design a modular monolith with separate API and worker processes built from the same Go codebase. Consider this structure and adapt it based on the actual repository:
+Design a modular monolith built as a single process: one binary serves the HTTP API and runs the scan pipeline on background goroutines. Consider this structure and adapt it based on the actual repository:
 
 ```text
 cmd/
   api/main.go
-  worker/main.go
+  migrate/main.go
 internal/
   config/
   app/
@@ -62,21 +64,20 @@ internal/
   platform/
     mongodb/
     queue/
-    redis/
     observability/
 extension/
 docs/
 deploy/
 ```
 
-Define module responsibilities, public interfaces, data ownership, and allowed dependency direction. Avoid over-abstraction. Add interfaces at meaningful boundaries such as the provider, repository, and queue, where tests or substitution benefit.
+Define module responsibilities, public interfaces, data ownership, and allowed dependency direction. Avoid over-abstraction. Add interfaces at meaningful boundaries such as the provider, repository, and work delivery, where tests or substitution benefit.
 
 ### 3. Architecture documents
 
 Create or update these documents:
 
 1. `docs/architecture.md`
-   - Context, goals, architecture diagram, sequence diagram, trust boundaries, deployment topology, API and worker flow.
+   - Context, goals, architecture diagram, sequence diagram, trust boundaries, deployment topology, API and async-analysis flow.
 2. `docs/api-contract.md`
    - Request/response contracts, status codes, validation, error shape, rate limits, and idempotency.
 3. `docs/data-model.md`
@@ -110,7 +111,7 @@ Keep scan status separate from verdict. Possible statuses: `queued`, `submitting
 - Use deterministic URL normalization and preserve meaningful path/query distinctions.
 - Use a Public Suffix List-aware library to extract registrable domains.
 - Generate a backend-keyed HMAC-SHA-256 fingerprint.
-- Do not persist raw URLs by default. If raw URLs must survive in queue payloads to submit to the provider, encrypt the transient payload, minimize retention, keep it out of logs, and delete it once no longer needed.
+- Do not persist raw URLs by default. If a raw URL must survive between accepting a submission and the scan runner handing it to the provider, encrypt it, minimize retention, keep it out of logs, and delete it once no longer needed. The work record itself carries no URL: it is a scan identifier and lease state.
 - Treat hashes as pseudonymous identifiers, not encryption or guaranteed anonymity.
 - Create a unique index for exact-URL fingerprints and indexes needed for host/domain lookup, expiry, and scan recovery.
 - Do not assume that different paths/subdomains are equivalent.
@@ -121,15 +122,26 @@ Before implementing provider calls, read `https://hybrid-analysis.com/docs/api/v
 
 Encapsulate provider details in `internal/modules/providers/hybranalysis`. Use Go `context.Context`, bounded `http.Client` timeouts, response-size limits, retry/backoff only for retryable failures, and typed internal errors. Do not fabricate provider fields or hard-code unverified assumptions. Keep the API key server-side.
 
-### 7. Async worker and queue
+### 7. Async analysis and work delivery
 
-- Do not keep the API request open for the entire remote analysis lifecycle.
-- Prevent duplicate concurrent scans for the same canonical fingerprint.
+- Do not keep the API request open for the entire remote analysis lifecycle. This
+  is the property that matters, and goroutines satisfy it: `check-url` returns
+  `202` before any analysis exists, so a detonation measured in minutes cannot
+  hold a connection open.
+- Prevent duplicate concurrent scans for the same canonical fingerprint, with a
+  partial unique index in MongoDB rather than an application check.
+- Claim work by a time-bounded lease on the scan document, stamped by one atomic
+  `findAndModify`. Exclusivity and crash recovery both come from the server: a
+  dead consumer releases nothing, and expiry is what returns its work.
+- Size the lease from the longest possible unit of work and derive it rather
+  than exposing it as an independent setting, so no configuration can produce a
+  second submission of the same URL.
+- Store a deferred retry's due time on the document. Nothing needs promoting.
 - Use bounded retries and respect `Retry-After` when present.
-- Use a queue interface so the implementation can be changed.
-- Evaluate a Redis-backed Go task queue such as Asynq, checking current status/compatibility before committing.
-- Implement graceful shutdown and worker recovery.
-- Treat MongoDB as the source of truth; queue/cache data is transient coordination state.
+- Use a delivery interface so the implementation can be changed, and do not
+  introduce a broker datastore without measured justification.
+- Implement graceful shutdown, and recover abandoned work by lease expiry.
+- Treat MongoDB as the source of truth for both results and pending work.
 
 ### 8. Ruleset generation and extension behavior
 
@@ -145,13 +157,16 @@ Encapsulate provider details in `internal/modules/providers/hybranalysis`. Use G
 ### 9. Docker and operations
 
 Propose a `deploy/compose.yaml` with:
-- `api`: Go API process.
-- `worker`: Go worker process using the same codebase/image but a different command.
-- `mongodb`: database.
-- `redis`: only if used for queue/cache.
+- `backend`: one Go process serving the API and running the scan pipeline.
+- `migrate`: one-shot index creation, completed before the API starts.
+- `mongodb`: database, and the work queue.
 - Elasticsearch only in an optional profile if specifically justified.
 
 Use service names for container-to-container networking. Keep internal service ports private. Add health checks, dependency readiness, persistent MongoDB storage, multi-stage Go builds, and a non-root runtime where practical. Do not mount the Docker socket into application containers.
+
+Do not add a worker service or a broker service. Two replicas already contend for
+work safely through the claim lease, so a second process would add coordination
+without adding throughput.
 
 ### 10. Tests and quality gates
 
@@ -161,7 +176,9 @@ Document or add a staged plan for:
 - State transitions and expiration.
 - Provider response mapping and mocked provider failures.
 - Cache hit, cache miss, and concurrent deduplication.
-- Queue retries and recovery.
+- Claim exclusivity and lease expiry, against a real MongoDB. Both are properties
+  of the server, so an in-memory double would only restate the assumption.
+- Retry deferral and recovery of work abandoned by a killed process.
 - Ruleset version stability.
 - URL/secret redaction in logs.
 - Extension behavior for cached, queued, unknown, and failed results.

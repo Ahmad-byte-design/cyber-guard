@@ -92,7 +92,7 @@ jobs:
         run: go build ./...
 
   # Unit tests need no external service, so they run in the fast job and fail
-  # without waiting for MongoDB or Redis to start.
+  # without waiting for MongoDB to start.
   unit:
     name: unit tests and race detector
     runs-on: ubuntu-latest
@@ -133,12 +133,12 @@ jobs:
           path: server/coverage.out
           if-no-files-found: ignore
 
-  # Integration tests against real MongoDB and Redis.
+  # Integration tests against real MongoDB.
   #
-  # MongoDB is pinned to 9.0 for the reason in docker-compose.yml: 8.0 refuses
-  # to start on kernel 6.19+. Redis runs with --maxmemory-policy noeviction,
-  # because an eviction policy silently drops queued jobs and makes a lost job
-  # indistinguishable from an evicted one.
+  # MongoDB is the only datastore: the scans collection is the work queue and
+  # the rate-limit counters are in-process, so there is nothing else to start.
+  # It is pinned to 9.0 for the reason in docker-compose.yml: 8.0 refuses to
+  # start on kernel 6.19+.
   integration:
     name: integration tests
     runs-on: ubuntu-latest
@@ -153,29 +153,19 @@ jobs:
           --health-timeout 5s
           --health-retries 10
           --health-start-period 20s
-      redis:
-        image: redis:8-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 3s
-          --health-retries 10
-          --health-start-period 5s
     env:
       MONGODB_URI: mongodb://localhost:27017
+      # Each integration package uses its own database, so one that drops its
+      # collections cannot delete another's data mid-run.
       MONGODB_DATABASE: cyberguard_ci
-      REDIS_ADDR: localhost:6379
-      # The application uses DB 0; each integration package uses its own, so a
-      # package that flushes cannot delete another's keys mid-run.
-      REDIS_TEST_DB_QUEUE: "1"
-      REDIS_TEST_DB_LIMIT: "2"
-      REDIS_TEST_DB_SCAN: "3"
       # Ruleset generation is exercised; no provider is contacted either way.
       ANALYSIS_PROVIDER: mock
       URL_FINGERPRINT_HMAC_KEY: ci-fingerprint-key-not-a-secret
-      URL_ENCRYPTION_KEY: ci-encryption-key-0123456789abcdef
+      # Must be hex, because config.Load decodes it: a value that is not
+      # hex-decodable fails the load, and every package that calls Load then
+      # reports a config failure instead of its own result. 64 hex characters is
+      # what `openssl rand -hex 32` produces — the same shape the local .env has.
+      URL_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
     steps:
       - uses: actions/checkout@v4
 
@@ -217,7 +207,7 @@ jobs:
 
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build the API and worker image
+      - name: Build the API image
         uses: docker/build-push-action@v6
         with:
           context: ./server
@@ -230,11 +220,24 @@ jobs:
       - name: Smoke test the built binaries
         run: |
           set -euo pipefail
-          # --version must work without any configuration, network or secret:
-          # it is the one thing that must not depend on a running service.
-          docker run --rm cyberguard-server:ci cyberguard-api -version
-          docker run --rm cyberguard-server:ci cyberguard-worker -version
-          docker run --rm cyberguard-server:ci cyberguard-migrate -version
+          # --version must work with no configuration, no network and no
+          # secret: it is the one thing that must not depend on a running
+          # service, a datastore or a provider.
+          #
+          # --entrypoint is required. The image's entrypoint is already
+          # cyberguard-api, so passing the binary name as an argument yields
+          # "cyberguard-api cyberguard-api -version"; Go's flag package stops
+          # at the first non-flag argument, -version is never seen, and the
+          # process falls through to config validation and exits 1.
+          for binary in cyberguard-api cyberguard-migrate; do
+            output="$(docker run --rm --entrypoint "/usr/local/bin/$binary" \
+              cyberguard-server:ci -version)"
+            echo "$output"
+            case "$output" in
+              "$binary "*) ;;
+              *) echo "$binary did not report its version"; exit 1 ;;
+            esac
+          done
 
   # The compose topology is where the migration-ordering bug lived: a
   # deployment that started without its indexes silently lost deduplication.
@@ -265,7 +268,7 @@ jobs:
           set -euo pipefail
           docker compose exec -T mongodb mongosh --quiet cyberguard --eval '
             const need = {
-              scans: ["uniq_active_scan"],
+              scans: ["uniq_active_scan", "by_claimable"],
               assessments: ["ttl_expires_at"],
               transient_urls: ["ttl_expires_at"]
             };
@@ -280,7 +283,7 @@ jobs:
             print("all required indexes present");
           '
 
-      - name: The API and worker are running
+      - name: The API is running
         run: |
           set -euo pipefail
           for _ in $(seq 1 30); do
@@ -288,16 +291,28 @@ jobs:
             sleep 2
           done
           cat /tmp/ready.json
-          docker compose ps --status=running --services | grep -qx worker
+          docker compose ps --status=running --services | grep -qx backend
 
       - name: End-to-end scan with the mock provider
         run: |
           set -euo pipefail
-          submit="$(curl -fsS -X POST localhost:8080/api/v1/check-url \
+          # This also exercises the in-process scan runner: nothing else is
+          # running, so the poll below only succeeds if the API claimed its own
+          # scan out of the scans collection and analysed it. The submission
+          # must still return 202 with no verdict, which is the part of the
+          # contract a "just make it synchronous" fix would silently break.
+          code="$(curl -sS -o /tmp/submit.json -w '%{http_code}' \
+            -X POST localhost:8080/api/v1/check-url \
             -H 'Content-Type: application/json' \
             -d '{"url":"https://example.test/malicious/ci-check"}')"
-          echo "$submit"
-          scan="$(printf '%s' "$submit" | grep -o '"scan_id":"[^"]*"' | cut -d'"' -f4)"
+          echo "$code $(cat /tmp/submit.json)"
+          [ "$code" = "202" ] || { echo "check-url returned $code, want 202"; exit 1; }
+          grep -q '"cached":false' /tmp/submit.json
+          if grep -q '"verdict"' /tmp/submit.json; then
+            echo "a freshly queued scan carried a verdict"
+            exit 1
+          fi
+          scan="$(grep -o '"scan_id":"[^"]*"' /tmp/submit.json | cut -d'"' -f4)"
 
           for _ in $(seq 1 30); do
             result="$(curl -fsS "localhost:8080/api/v1/get-url/$scan")"

@@ -1,7 +1,7 @@
 # CyberGuard AI — API Contract
 
 > **Status:** Accepted. All three endpoints are implemented end to end against
-> MongoDB and Redis, including the generated protection ruleset. See
+> MongoDB, including the generated protection ruleset. See
 > [`architecture.md` §8](architecture.md#8-current-implementation-status).
 >
 > **OpenAPI 3.1 is the authoritative contract** per
@@ -36,7 +36,9 @@ Three properties are worth stating because they are deliberate:
 - **Swagger UI is vendored, not fetched.** The assets are pinned at
   `swagger-ui-dist` 5.17.14 (Apache-2.0, licence included in the tree) and
   embedded. No CDN is contacted at runtime, so the page renders in an
-  air-gapped environment.
+  air-gapped environment. The pinned release is read from `assets/VERSION` and
+  printed on the page itself — the first question asked when a documentation page
+  misbehaves, and one an operator should not have to leave the browser to answer.
 - **No authentication was added for it.** The service has no accounts. Putting a
   login in front of a static document would be security theatre that breaks the
   only use case it has. `API_DOCS_ENABLED=false` is the control.
@@ -45,7 +47,11 @@ Three properties are worth stating because they are deliberate:
 resolves its asset and specification URLs relative to itself.
 
 Both endpoints support `ETag` / `If-None-Match`, returning `304` when a client
-already holds the current representation.
+already holds the current representation. The tag is a digest of the bytes, not a
+timestamp, so it is stable for the life of a deployment and only changes when the
+served representation does. The vendored assets additionally carry
+`Cache-Control: public, max-age=31536000, immutable`, since their URLs never
+change content within a release.
 
 ## 1. Naming
 
@@ -132,14 +138,17 @@ without parsing `detail`.
 
 Mandatory per
 [ADR 0014](decisions/0014-abuse-protection-without-authentication.md).
-**Implemented in phase 4** as Redis fixed-window counters.
+**Implemented in phase 4** as in-process fixed-window counters
+(`internal/ratelimit`), and the service still runs the scan pipeline in the same
+process — so "in-process" means one process, not a subsystem shared with
+another one.
 
 | Control | Value | Key |
 |---|---|---|
 | Per-client request rate | 60 req/min | Client IP, or install token where deployed |
 | Per-fingerprint submission rate | 10/hour | `url_fingerprint` |
 | Global daily submission ceiling | Configurable | Global counter |
-| Concurrent provider submissions | Configurable, ≤ provider limit | Worker semaphore |
+| Concurrent provider submissions | Configurable, ≤ provider limit | Semaphore in the in-process scan runner |
 | Global concurrent requests | Configurable | Semaphore in middleware |
 | Request body | 8 KiB | `http.MaxBytesReader` |
 | URL length | 2048 chars | — |
@@ -148,17 +157,30 @@ Responses: `429` with `Retry-After`. On every response:
 `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`.
 
 Quota exhaustion **fails closed**: `503` with `Retry-After`, and no new
-submissions are enqueued. It must never fail open by exceeding the provider's
+submission is accepted. It must never fail open by exceeding the provider's
 contract.
 
 The per-fingerprint limit is the control that actually protects quota, because
 it works with no client identity at all — it is unaffected by shared NAT egress,
 which defeats per-IP limits.
 
-Counters live in Redis. If Redis is unreachable, these controls cannot be
-evaluated, so submissions stop rather than proceed unguarded: a limiter error is
-a `503`, never a permissive result. Silently allowing traffic when the limiter is
-broken would turn a visible outage into an invisible, unbounded provider bill.
+The counters live in process memory, so **their scope is this process**. If the
+counters cannot be evaluated, these controls are not enforced, so submissions
+stop rather than proceed unguarded: a limiter error is a `503`, never a
+permissive result. Silently allowing traffic when the limiter is broken would
+turn a visible outage into an invisible, unbounded provider bill. An in-process
+limiter has no datastore that can be unreachable, so this path is currently
+unreachable — it is kept because the distinction between "the limit was hit"
+and "the limiter is broken" is one a caller must be able to make, and because
+the obvious future fix for per-replica scope is a shared counter store behind
+this same interface.
+
+That per-process scope is the real limit on this design and it is worth stating
+without softening: **the configured limits are per replica**, and a restart
+resets every counter. Running three replicas allows three times the configured
+submission rate against a finite quota. Acceptable at one replica; not
+acceptable against a hard financial ceiling at several. See
+[ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md).
 
 Two implementation details that are decisions rather than defaults:
 
@@ -172,10 +194,12 @@ Two implementation details that are decisions rather than defaults:
   quota — against the quota protection, and would make a repeatedly-visited
   benign URL look like an attack.
 
-The subject is hashed before it becomes a Redis key. A fingerprint is already an
-HMAC and safe, but a client address is personal data that should not sit in a
-key listing readable with `redis-cli`, and hashing both keeps the rule uniform
-rather than dependent on each caller's care.
+The subject is hashed before it becomes a counter key. A fingerprint is already
+an HMAC and safe, but a client address is personal data that should not sit
+readable in a key namespace that any tooling could dump — and the counters are
+swept on expiry, so a raw address in one would be personal data held for the
+window's duration and then discarded. Hashing both subjects keeps the rule
+uniform rather than dependent on each caller's care.
 
 A refused request is never told to wait zero seconds; `Retry-After` has a one
 second floor, because a client told to retry immediately will hammer the
@@ -339,7 +363,8 @@ they are the example domain throughout this project's own documentation.
 
 ## 4. `GET /api/v1/get-url/{scanId}`
 
-Polls for the outcome of an accepted submission.
+Polls for the outcome of an accepted submission. §4a is the same lookup for a
+client that still has the URL but no longer has the identifier.
 
 ### Path parameter
 
@@ -421,6 +446,68 @@ The extension should poll with exponential backoff (1s, 2s, 4s … capped at
 determine". The scan may still complete server-side and populate the cache for
 next time.
 
+### 4a. When the client no longer has the scan ID
+
+A client that has lost the `scan_id` — a new tab, a restarted session, a
+rebuild — can ask by URL instead:
+
+| | |
+|---|---|
+| **Endpoint** | `POST /api/v1/get-url` |
+| **Body** | `{"url": "https://example.test/login"}` — identical to §3 |
+| **Rate limit** | The same budget as §4, per client per minute |
+| **Returns** | The same `ScanResult` shape as §4 |
+
+Two properties make this a different endpoint rather than a duplicate.
+
+**It reads; it never starts anything.** No scan is created, no work is made
+claimable, no provider is contacted. That is a boundary, not an implementation
+detail: a lookup that could trigger analysis would be a second submission
+endpoint under another name, with none of the per-fingerprint quota accounting
+that protects `check-url`. A caller that wants a *verdict* uses §3, which
+analyses what is missing and returns `200` when a fresh verdict already exists.
+
+**It returns the most recent scan, in any status.** Not the most recent
+*completed* one: reporting an older verdict while a fresh analysis of the same
+URL is still running answers a question the caller did not ask. When no scan has
+ever been created for the URL the answer is `404 scan_not_found` — the same code
+as an unknown scan ID, so a client cannot use the two to tell which URLs have
+been scanned by comparing response shapes.
+
+### Why 4a is a POST and not `GET /api/v1/get-url/{url}`
+
+A URL in a path is a URL in every access log on the way: this service's, the
+reverse proxy's, the load balancer's, a CDN's. That is the exposure
+[ADR 0013](decisions/0013-durable-jobs-and-url-privacy.md) exists to prevent,
+and it is exactly why §4 takes an opaque identifier. A request body is not
+recorded by any of those by default.
+
+The cost is that 4a cannot be linked to, prefetched or cached by a URL-aware
+intermediary. For a rate-limited diagnostic read, keeping the URL out of the
+logs is worth more than being linkable.
+
+### Validation is identical to §3
+
+Same rules, same status codes, same `code` values, including the target gate and
+the 400/422 split — `400` when the body is unparseable or is not a JSON object
+with a `url` field; `422` when the body is well-formed and the *value* is
+unacceptable. One implementation validates both, in `scans.Service.LookupByURL`,
+so the two endpoints cannot drift apart and a client that submits and then polls
+never sees a validation error change shape.
+
+The URL is used only to compute the fingerprint. It is not stored, no
+transient-URL row is written, and it is not logged — a read has nothing to
+clean up afterwards.
+
+| Code | Meaning |
+|---|---|
+| `200` | The most recent scan for this URL |
+| `400` | Body unparseable, or not a JSON object with a `url` field |
+| `404` | No scan has ever been created for this URL |
+| `422` | The URL is unacceptable — same rules as §3 |
+| `429` | Per-client budget spent |
+| `503` | Fingerprinting unavailable, or the datastore is down |
+
 ## 5. `GET /api/v1/get-all?version={clientVersion}`
 
 Returns the current browser ruleset, not scan history.
@@ -496,9 +583,9 @@ a partial ruleset.
 | Endpoint | Meaning | Checks |
 |---|---|---|
 | `GET /health/live` | Process is alive | Nothing. Always `200` while the process serves. |
-| `GET /health/ready` | Should traffic be routed here | HMAC key present; URL encryption key present; MongoDB ping; Redis ping; provider configured |
+| `GET /health/ready` | Should traffic be routed here | HMAC key present; URL encryption key present; MongoDB ping; provider configured |
 
-Liveness deliberately excludes dependencies. A MongoDB or Redis outage must
+Liveness deliberately excludes dependencies. A MongoDB outage must
 not make an orchestrator restart every replica — that converts a dependency
 failure into a full outage.
 
@@ -510,24 +597,30 @@ failure into a full outage.
     { "name": "url_fingerprint_hmac_key", "ok": true },
     { "name": "url_encryption_key", "ok": true },
     { "name": "mongodb", "ok": true },
-    { "name": "redis", "ok": false, "why": "rate-limit and queue state unavailable" },
+    { "name": "scan_pipeline", "ok": false, "why": "the scan lifecycle was not wired into this instance" },
     { "name": "provider", "ok": false, "why": "HYBRID_ANALYSIS_API_KEY is not set" }
   ]
 }
 ```
 
 A `provider` failure is reported as a degraded sub-check rather than a global
-`503`, because cached reads still work without a provider. A `redis` failure
-**does** fail readiness, because rate-limit and quota enforcement cannot be
-evaluated without it ([ADR 0014](decisions/0014-abuse-protection-without-authentication.md)).
+`503`, because cached reads still work without a provider. Anything else
+failing **does** fail readiness, because submissions cannot be accepted or the
+abuse controls cannot be evaluated without it
+([ADR 0014](decisions/0014-abuse-protection-without-authentication.md)).
+
+`scan_pipeline` reports that the scan lifecycle was not wired into this
+instance. It is worth reading now that the analysis runs in the API: previously a
+ready instance whose *worker* was missing looked identical to a healthy one,
+because the worker was a separate deployment. There is no such blind spot left —
+if this instance cannot analyse, it says so.
 
 Currently implemented: all of them. A healthy deployment reports `config`,
-`mongodb`, `redis` and `provider`; `url_fingerprint_hmac_key`,
-`url_encryption_key` and `scan_pipeline` appear **only when they fail**, so a
-clean response stays short and a failing one names the cause. The `why` field
-is a generic description and never carries driver error text, because this
-endpoint is unauthenticated and driver errors can embed hosts, topology and
-credentials.
+`mongodb` and `provider`; `url_fingerprint_hmac_key`, `url_encryption_key` and
+`scan_pipeline` appear **only when they fail**, so a clean response stays short
+and a failing one names the cause. The `why` field is a generic description and
+never carries driver error text, because this endpoint is unauthenticated and
+driver errors can embed hosts, topology and credentials.
 
 ## 7. Implementation gaps against this contract
 

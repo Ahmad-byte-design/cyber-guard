@@ -83,7 +83,7 @@ paths:
       description: |
         Reports that the process is alive and serving.
 
-        Deliberately checks no dependency. A MongoDB or Redis outage must not
+        Deliberately checks no dependency. A MongoDB outage must not
         cause an orchestrator to restart every replica, which would turn a
         dependency failure into a full outage.
       security: []
@@ -134,8 +134,6 @@ paths:
                     ok: true
                   - name: mongodb
                     ok: true
-                  - name: redis
-                    ok: true
                   - name: provider
                     ok: true
         "503":
@@ -176,7 +174,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/CheckURLRequest"
+              $ref: "#/components/schemas/URLRequest"
             examples:
               valid:
                 value:
@@ -268,7 +266,7 @@ paths:
                     scan_id: scan_01J8ZP4K7Q
                     status: queued
                 running:
-                  summary: A worker holds it and the submission is in flight.
+                  summary: A scan runner has claimed it and the submission is in flight.
                   value:
                     scan_id: scan_01J8ZP4K7Q
                     status: running
@@ -336,6 +334,110 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /api/v1/get-url:
+    post:
+      tags: [analysis]
+      operationId: getScanByURL
+      summary: Retrieve the current state of the most recent scan for a URL
+      description: |
+        The same lookup as `GET /api/v1/get-url/{scanId}`, for a caller that
+        has a URL but did not keep the scan ID.
+
+        ### Why this is a POST and not `GET /api/v1/get-url/{url}`
+
+        A URL in a path is a URL in every access log between here and the
+        client: this service's, the reverse proxy's, the load balancer's, and
+        anything else that records request lines. That is the exposure
+        [ADR 0013](decisions/0013-durable-jobs-and-url-privacy.md) exists to
+        prevent, and it is why the by-ID form takes an opaque identifier.
+
+        A request body is not recorded by any of those by default. Expressing
+        the lookup as a POST keeps the URL out of every access log while still
+        letting a client find its scan.
+
+        The trade is that this endpoint cannot be linked to, prefetched, or
+        cached by a URL-aware intermediary. For a rate-limited diagnostic read
+        that is the right way round.
+
+        ### This reads; it never starts anything
+
+        No scan is created, nothing is queued, and no provider is contacted. A
+        caller that wants a **verdict** should use `POST /api/v1/check-url`,
+        which analyses what is missing and returns `200` when a fresh verdict
+        already exists.
+
+        This matters for quota as well as for semantics: a lookup that could
+        trigger analysis would be a second submission endpoint under another
+        name, with no separate accounting.
+
+        ### Which scan is returned
+
+        The most recent one, in any status. Not the most recent *completed* one:
+        reporting an older verdict while a fresh analysis of the same URL is
+        still running would answer a question the caller did not ask. When no
+        scan exists at all the result is `404 scan_not_found`.
+
+        ### Validation
+
+        Identical to `POST /api/v1/check-url`, including the target gate. The
+        same URL therefore produces the same status and the same `code` through
+        either endpoint, so a client that submits and then polls never sees a
+        validation error change shape between calls.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/URLRequest"
+            example:
+              url: https://example.test/login
+      responses:
+        "200":
+          description: |
+            The most recent scan for this URL. Identical in shape to
+            `GET /api/v1/get-url/{scanId}`, and a verdict is present only when
+            the scan is `completed` and its assessment is still fresh.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ScanResult"
+              example:
+                scan_id: scan_01J8ZP4K7Q
+                status: completed
+                verdict: malicious
+                provider: mock
+                evidence:
+                  - type: provider_verdict
+                    summary: "analysis finished with verdict malicious; provider state SUCCESS"
+                analyzed_at: "2026-10-17T09:56:13Z"
+                expires_at: "2026-10-17T10:56:13Z"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "404":
+          description: No scan has ever been created for this URL.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+              example:
+                type: https://cyberguard.example/problems/scan_not_found
+                title: Scan not found
+                status: 404
+                detail: no scan record exists for this url
+                instance: /api/v1/get-url
+                request_id: 40831b5ecb146081731ec7fb
+                code: scan_not_found
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /api/v1/get-all:
     get:
       tags: [rulesets]
@@ -373,12 +475,26 @@ paths:
 
         | Scope | Match | Evidence required (defaults) |
         |---|---|---|
-        | `exact_url` | one `scheme://host/path` | 2 findings on the host |
+        | `exact_url` | one `scheme://host[:port]/path` | 2 findings on the host |
         | `url_prefix` | one path prefix on one host | 3 findings on that prefix |
         | `registrable_domain` | the registrable domain and its subdomains | 5 findings across the domain |
 
         The default ceiling is `exact_url`, so a default deployment can never
         emit anything broader than a single-URL rule.
+
+        ### Actions
+
+        `RULESET_ACTION` selects `block` (the default) or `redirect`. A
+        redirect sends the user to the extension page named by
+        `RULESET_REDIRECT_PATH`, which must be declared in the client's
+        `web_accessible_resources` or Chrome refuses to install the ruleset.
+
+        ### Limits
+
+        `RULESET_MAX_RULES` caps the snapshot and `RULESET_MAX_REGEX_RULES` caps
+        the rules built on a regular expression. The second is the tighter
+        constraint: Chrome's documented limit is 1000 per ruleset, and exceeding
+        it makes Chrome ignore the ruleset rather than reject it.
 
         ### Versioning
 
@@ -813,8 +929,14 @@ components:
         - timed_out
         - expired
 
-    CheckURLRequest:
+    URLRequest:
       type: object
+      description: |
+        A URL to act on.
+
+        Used by `POST /api/v1/check-url`, which may create a scan, and by
+        `POST /api/v1/get-url`, which only reads. The two validate identically,
+        so the same URL produces the same result whichever is used.
       required: [url]
       additionalProperties: false
       properties:
@@ -825,7 +947,11 @@ components:
           description: |
             An absolute `http` or `https` URL. Rejected if it carries embedded
             credentials, exceeds 2048 characters, contains control characters,
-            or has no hostname.
+            has no hostname, or names a loopback, private, reserved or internal
+            address.
+
+            The value is **never** stored and **never** logged. It exists in
+            this request only long enough to compute a keyed fingerprint.
 
     Evidence:
       type: object
@@ -961,20 +1087,209 @@ components:
         rules:
           type: array
           description: |
-            Chrome `declarativeNetRequest` rules, with contiguous identifiers
-            starting at 1.
+            Chrome `declarativeNetRequest` rules, with unique positive
+            identifiers.
 
-            Every rule is validated against Chrome's schema before publication.
-            An invalid rule fails the **entire** snapshot: a partial ruleset is
-            never published, because it would silently under-block while the
-            client believed coverage was complete.
+            Every rule is validated against Chrome's documented schema before
+            publication. An invalid rule fails the **entire** snapshot: a
+            partial ruleset is never published, because it would silently
+            under-block while the client believed coverage was complete.
 
             Provenance is stored alongside each rule for audit but is **not**
             emitted here — Chrome rejects unknown members inside a Rule, so
             including it would break the ruleset on the client's machine.
           items:
-            type: object
-            additionalProperties: true
+            $ref: "#/components/schemas/DNRRule"
+
+    DNRRule:
+      type: object
+      description: |
+        One Chrome `declarativeNetRequest` rule.
+
+        CyberGuard emits only two action types. It never emits `allow` or
+        `allowAllRequests`, because those grant trust and this service only
+        ever withholds it, and never `upgradeScheme` or `modifyHeaders`,
+        because neither is a protection decision this product makes.
+
+        ### Identifier strategy
+
+        Identifiers are assigned by position in the published order, so they
+        are positive and contiguous from 1 and deterministic for a given body
+        of evidence. They are **not** stable across a removal: dropping the
+        first rule shifts later identifiers by one.
+
+        That is deliberate. A client replaces the whole ruleset rather than
+        reconciling rule-by-rule, and an identifier that stayed put while its
+        meaning changed would be worse than one that shifts.
+
+        ### Priority and precedence
+
+        Every rule carries the same priority. Chrome resolves a request to at
+        most one action by ordering matching rules by priority and then, at
+        equal priority, by action — `allow` > `block` > `upgradeScheme` >
+        `redirect`.
+
+        Since no `allow` rule is emitted, a `block` rule and a `redirect` rule
+        that both match resolve to **block**. That is the outcome this product
+        wants, so the ordering is left to Chrome rather than pinned, and the
+        published ruleset does not depend on an implementation detail the
+        documentation explicitly says is not standardised between runs.
+
+        ### Regex rules
+
+        Rules built on `regexFilter` are capped at 1000 per ruleset, which is
+        Chrome's documented limit and far below the total rule limit. Exceeding
+        it makes Chrome ignore the ruleset rather than reject it, so a client
+        would carry no protection while appearing up to date.
+      required: [id, priority, action, condition]
+      additionalProperties: false
+      properties:
+        id:
+          type: integer
+          minimum: 1
+          description: Unique positive identifier within the ruleset.
+        priority:
+          type: integer
+          minimum: 1
+          description: |
+            Chrome's rule priority. Uniform across every emitted rule, so
+            action precedence is decided by Chrome's documented ordering.
+        action:
+          $ref: "#/components/schemas/DNRAction"
+        condition:
+          $ref: "#/components/schemas/DNRCondition"
+
+    DNRAction:
+      type: object
+      required: [type]
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum: [block, redirect]
+          description: |
+            `block` refuses the request. `redirect` sends it to a page inside
+            the extension instead.
+
+            Chrome's tie-break at equal priority puts `block` ahead of
+            `redirect`, so where both match, the request is blocked.
+        redirect:
+          $ref: "#/components/schemas/DNRRedirect"
+          description: Present if and only if `type` is `redirect`.
+
+    DNRRedirect:
+      type: object
+      required: [extensionPath]
+      additionalProperties: false
+      properties:
+        extensionPath:
+          type: string
+          pattern: "^/[^?#]*$"
+          description: |
+            A path relative to the extension's own directory, resolving to
+            `chrome-extension://<id>/locked.html`.
+
+            Chrome also permits `redirect.url` and `redirect.transform`. Neither
+            is emitted and neither is modelled here: both would send a user's
+            browser to a destination chosen by an assessment rather than by this
+            policy.
+
+            **Client obligation:** the extension must declare this path in its
+            manifest `web_accessible_resources`. Chrome refuses a DNR redirect to
+            a resource that is not web accessible, and the ruleset will not
+            install.
+      example:
+        extensionPath: /locked.html
+
+    DNRCondition:
+      type: object
+      description: |
+        What a rule matches.
+
+        Exactly one of `urlFilter` and `filter` may be set.
+      additionalProperties: false
+      properties:
+        urlFilter:
+          type: string
+          maxLength: 30000
+          description: |
+            Chrome's pattern syntax, used for the registrable-domain and
+            URL-prefix scopes.
+
+            The grammar is `(optional anchor) + pattern + (optional anchor)`
+            with only four constructs — `*`, `|`, `||` and `^` — and **no
+            documented escape**. A candidate whose host or path contains an
+            operator, or a non-ASCII character, is therefore **rejected** rather
+            than escaped into a pattern nobody can verify.
+
+            Emitted forms are `||host^` and `||host^/prefix`. `||` anchors to
+            the start of a (sub-)domain, so the literal begins at a label
+            boundary and `evil-example.com` is not matched by a rule for
+            `example.com`. `^` matches any character that is not a letter,
+            digit, `_`, `-`, `.` or `%`, and also the end of the URL, which is
+            what stops `example.com` from matching `example.company`.
+          examples:
+            - "||example.com^"
+            - "||example.com/login^"
+        filter:
+          type: object
+          description: |
+            Chrome's RE2 matcher, used for the exact-URL scope because
+            `urlFilter` is a prefix match and would also cover longer paths.
+          required: [type, regexFilter]
+          additionalProperties: false
+          properties:
+            type:
+              type: string
+              enum: [regexFilter]
+            regexFilter:
+              type: string
+              maxLength: 2048
+              description: |
+                An anchored RE2 pattern: `^scheme://host[:port]/path$`.
+
+                Chrome requires a regex to be ASCII only, because it is matched
+                against a URL whose host is punycoded and whose other characters
+                are percent-encoded.
+
+                The **query string is not part of the pattern**, because the
+                assessment does not retain one. Two URLs differing only in query
+                therefore share a rule — recorded in
+                [ADR 0018](decisions/0018-ruleset-thresholds-and-scope.md).
+        resourceTypes:
+          type: array
+          description: |
+            The request types this rule applies to.
+
+            Always present. When both this and `excludedResourceTypes` are
+            omitted, Chrome treats the rule as matching every type **except
+            `main_frame`** — so omitting the list would silently stop a rule
+            blocking navigation, which is the opposite of its purpose.
+
+            A `block` rule uses the configured profile, which always includes
+            `main_frame`. A `redirect` rule is restricted to `main_frame` and
+            `sub_frame`: replacing a sub-resource with an HTML page would break
+            the page rather than protect it.
+          minItems: 1
+          uniqueItems: true
+          items:
+            type: string
+            enum:
+              - main_frame
+              - sub_frame
+              - stylesheet
+              - script
+              - image
+              - font
+              - object
+              - xmlhttprequest
+              - ping
+              - csp_report
+              - media
+              - websocket
+              - webtransport
+              - webbundle
+              - other
 
     HealthCheck:
       type: object
@@ -982,7 +1297,7 @@ components:
       properties:
         name:
           type: string
-          examples: [config, url_fingerprint_hmac_key, url_encryption_key, scan_pipeline, mongodb, redis, provider]
+          examples: [config, url_fingerprint_hmac_key, url_encryption_key, scan_pipeline, mongodb, provider]
         ok:
           type: boolean
         why:

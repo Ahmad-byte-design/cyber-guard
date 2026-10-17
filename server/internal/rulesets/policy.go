@@ -130,6 +130,38 @@ type Policy struct {
 	// zero segments is the host itself, which is domain scope wearing a
 	// different name.
 	MinPathSegments int
+
+	// MaxRegexRules caps rules built on a regular expression.
+	//
+	// This is not a tuning knob and not the same as MaxRules. Chrome caps regex
+	// rules at 1000 per ruleset, separately from and far below the total limit,
+	// and the symptom of exceeding it is that the ruleset is ignored rather than
+	// rejected — a client would carry no protection while appearing up to date.
+	MaxRegexRules int
+
+	// Action is what an emitted rule does: block or redirect.
+	Action ActionType
+
+	// RedirectPath is the extension-relative page a redirect rule sends the user
+	// to, for example "/locked.html".
+	//
+	// It is configuration rather than a constant because the page belongs to the
+	// extension, which does not exist yet. The value is validated as an
+	// extension-relative path, so a misconfiguration cannot turn a redirect into
+	// an off-site navigation.
+	RedirectPath string
+
+	// ResourceProfile selects which request types a rule applies to.
+	ResourceProfile ResourceProfile
+
+	// Priority is the DNR rule priority every emitted rule carries.
+	//
+	// One value for all rules is deliberate. Chrome resolves a request to one
+	// action by ordering by priority and then, at equal priority, by action —
+	// block before redirect. Pinning a higher priority onto redirects would
+	// invert that, and would make the published ruleset depend on a Chrome
+	// implementation detail the documentation warns is not stable.
+	Priority int
 }
 
 // DefaultPolicy is the policy used when nothing is configured.
@@ -145,8 +177,16 @@ func DefaultPolicy() Policy {
 		MinCorroboration:       2,
 		MinCorroborationPrefix: 3,
 		MinCorroborationDomain: 5,
-		MaxRules:               5000,
+		MaxRules:               DefaultMaxRules,
 		MinPathSegments:        1,
+		MaxRegexRules:          DefaultMaxRegexRules,
+		// Block is the default because it is the strongest outcome and depends
+		// on nothing but the URL. A redirect depends on an extension page that
+		// does not exist yet, so it is opt-in.
+		Action:          ActionBlock,
+		RedirectPath:    "/locked.html",
+		ResourceProfile: ProfileNavigationAndActive,
+		Priority:        minRulePriority,
 	}
 }
 
@@ -175,6 +215,30 @@ func (p Policy) Validate() error {
 	}
 	if p.MinPathSegments < 0 {
 		return fmt.Errorf("rulesets: MinPathSegments must not be negative, got %d", p.MinPathSegments)
+	}
+	if p.MaxRegexRules < 0 {
+		return fmt.Errorf("rulesets: MaxRegexRules must not be negative, got %d", p.MaxRegexRules)
+	}
+	if p.MaxRegexRules > MaxRegexRules {
+		// Chrome would refuse or silently ignore the ruleset, not truncate it.
+		return fmt.Errorf("rulesets: MaxRegexRules %d exceeds Chrome's documented limit of %d",
+			p.MaxRegexRules, MaxRegexRules)
+	}
+	if !p.Action.Valid() {
+		return fmt.Errorf("rulesets: Action %q is not block or redirect", p.Action)
+	}
+	if p.Action == ActionRedirect {
+		// Validated through the same path a built rule uses, so configuration
+		// cannot introduce a redirect target the rule builder would refuse.
+		if err := (Redirect{ExtensionPath: p.RedirectPath}).validate(); err != nil {
+			return fmt.Errorf("rulesets: RedirectPath is not a usable extension path: %w", err)
+		}
+	}
+	if _, err := ResourceTypesFor(p.ResourceProfile); err != nil {
+		return err
+	}
+	if p.Priority < minRulePriority {
+		return fmt.Errorf("rulesets: Priority %d is below Chrome's minimum of %d", p.Priority, minRulePriority)
 	}
 	return nil
 }

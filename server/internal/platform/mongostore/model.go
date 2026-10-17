@@ -157,6 +157,7 @@ type Scan struct {
 	// The query string is never stored, at any point: it routinely carries
 	// session tokens. See ADR 0018.
 	Scheme     string `bson:"scheme,omitempty"      json:"-"`
+	Port       string `bson:"port,omitempty"        json:"-"`
 	PathPrefix string `bson:"path_prefix,omitempty" json:"-"`
 
 	// LastErrorCode is a CyberGuard-owned safe code. It never contains provider
@@ -167,6 +168,24 @@ type Scan struct {
 	UpdatedAt   time.Time  `bson:"updated_at"    json:"updated_at"`
 	StartedAt   *time.Time `bson:"started_at,omitempty"   json:"-"`
 	CompletedAt *time.Time `bson:"completed_at,omitempty" json:"-"`
+
+	// Work-claiming state. This collection is the queue: a scan becomes a job
+	// by being claimable, and no separate broker is involved. See
+	// docs/decisions/0013-durable-jobs-and-url-privacy.md and the lease helpers
+	// in claim.go.
+	//
+	// AvailableAt is when the scan may next be claimed. A retry that must not
+	// run immediately pushes this into the future, which is what replaced the
+	// Redis sorted set that used to hold deferred work.
+	//
+	// LeaseExpiresAt and LeaseOwner record who is working on it. A lease is a
+	// time-bounded claim rather than a permanent one: a consumer that crashes
+	// mid-job releases nothing, and the lease lapsing is what returns the work
+	// to the pool. That is why no cleanup step is needed after a crash — the
+	// clock does it.
+	AvailableAt    *time.Time `bson:"available_at,omitempty"    json:"-"`
+	LeaseExpiresAt *time.Time `bson:"lease_expires_at,omitempty" json:"-"`
+	LeaseOwner     string     `bson:"lease_owner,omitempty"      json:"-"`
 }
 
 // Assessment is a normalised, cached security verdict for one exact URL.
@@ -201,6 +220,7 @@ type Assessment struct {
 	// path is kept, never the scheme+host+query whole. See ADR 0018 — this
 	// trade needs an explicit decision from the project owner.
 	Scheme     string `bson:"scheme,omitempty"      json:"-"`
+	Port       string `bson:"port,omitempty"        json:"-"`
 	PathPrefix string `bson:"path_prefix,omitempty" json:"-"`
 
 	// Verdict is present only because an Assessment exists only once an

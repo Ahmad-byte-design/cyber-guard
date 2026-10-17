@@ -26,20 +26,21 @@
 //
 // # Why the reconciler exists
 //
-// MongoDB writes and Redis pushes are not one transaction. A scan can be
-// durably recorded while the enqueue fails, or succeed and then be lost to a
-// Redis restart. Nothing in Redis can repair this, because Redis does not know
-// the scan exists.
+// It used to repair a non-atomic gap: a scan was written to MongoDB and pushed
+// to Redis as two operations, so one could succeed and the other fail, and a
+// lost queue message was invisible to everything that could repair it. That gap
+// is gone. The scans collection is the queue, so a durable scan is by
+// construction a claimable job, and there is no second write that can fail.
 //
-// MongoDB can. Reconciler therefore treats MongoDB as the ledger and Redis as
-// delivery: any scan still in `queued` or `running` whose `updated_at` is older
-// than the stall threshold is re-enqueued. A lost queue message degrades to a
-// delay of one stall threshold plus one tick. It cannot become a lost scan.
+// What remains is consumer death. A consumer that stops mid-job leaves the scan
+// leased, and something has to notice. Two things do, deliberately overlapping:
+// the lease expires on its own clock, and the reconciler re-enqueues anything
+// still active whose updated_at has gone stale.
 //
-// The alternative — a transactional outbox — would make the enqueue atomic
-// with the scan write, but only inside a MongoDB replica set. The default
-// deployment is a standalone server with no transactions at all, so the
-// reconciler is not a simplification here; it is the only design available.
+// The reconciler is kept because it also owns the retry budget — a scan that
+// keeps stalling must eventually be failed rather than recovered forever — and
+// that policy belongs in one place rather than being split across a lease and a
+// consumer loop.
 //
 // # At-least-once, and why that is safe
 //
@@ -57,11 +58,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"strings"
 	"time"
 
 	"cyberguard/server/internal/platform/mongostore"
-	"cyberguard/server/internal/platform/redisqueue"
 	"cyberguard/server/internal/providers"
 	"cyberguard/server/internal/providers/hybridanalysis"
 	"cyberguard/server/internal/urlintel"
@@ -88,7 +89,8 @@ type Store interface {
 	UpdateScanStatus(ctx context.Context, scanID string, status mongostore.ScanStatus, lastErrorCode string) (mongostore.Scan, error)
 	RecordProviderSubmission(ctx context.Context, scanID, provider, providerScanID, providerSubmissionID, providerState string, environmentID *int) (mongostore.Scan, error)
 	RecordProviderState(ctx context.Context, scanID, providerState, errorType, errorOrigin string) (mongostore.Scan, error)
-	RecordScanTarget(ctx context.Context, scanID, scheme, pathPrefix string, clear bool) error
+	FindLatestScanByFingerprint(ctx context.Context, fingerprint string) (mongostore.Scan, error)
+	RecordScanTarget(ctx context.Context, scanID, scheme, port, pathPrefix string, clear bool) error
 	IncrementAttempts(ctx context.Context, scanID string) (mongostore.Scan, error)
 	FindActiveScanByProviderScanID(ctx context.Context, providerScanID string) (mongostore.Scan, error)
 	ListStalledScans(ctx context.Context, olderThan time.Time, limit int64) ([]mongostore.Scan, error)
@@ -104,6 +106,20 @@ type Store interface {
 	TakeTransientURL(ctx context.Context, aead cipher.AEAD, scanID string) (string, error)
 }
 
+// Job is one unit of delivered work.
+//
+// It carries a scan ID and nothing else. There is deliberately no field a raw
+// URL could travel in, which is how ADR 0013's "scan IDs only" rule is enforced
+// structurally rather than by convention.
+type Job struct {
+	ScanID string
+}
+
+// ErrNoJob means the queue had nothing to deliver before the caller's block
+// expired. It is the ordinary idle path: a consumer backs off and tries again,
+// and must never report it as a failure.
+var ErrNoJob = errors.New("scans: no job available")
+
 // Queue is the delivery mechanism.
 //
 // The signature deliberately names a scan ID. There is no parameter through
@@ -112,8 +128,12 @@ type Store interface {
 type Queue interface {
 	Enqueue(ctx context.Context, scanID string) error
 	EnqueueRetry(ctx context.Context, scanID string, delay time.Duration) error
-	Claim(ctx context.Context, block time.Duration) (redisqueue.Job, error)
+	Claim(ctx context.Context, block time.Duration) (Job, error)
 	PromoteDue(ctx context.Context, limit int) (int, error)
+	// Release returns a lease early. Optional: a queue that hands out
+	// time-bounded claims and needs no explicit release may return nil for an
+	// unknown scan.
+	Release(ctx context.Context, scanID string) error
 }
 
 // Sentinel errors the HTTP layer maps to status codes.
@@ -452,8 +472,13 @@ type Outcome struct {
 	Cached bool
 	// Created reports this request created the scan.
 	Created bool
-	// Enqueued reports the job reached Redis. False with Created true means the
-	// reconciler will deliver it instead.
+	// Enqueued reports the scan was made claimable. False with Created true
+	// means the reconciler will make it claimable instead.
+	//
+	// The field is kept because the distinction is real — it is what separates
+	// "durably recorded and deliverable" from "durably recorded and waiting for
+	// the reconciler" — but it can no longer mean "the broker lost it", because
+	// there is no broker to lose it.
 	Enqueued bool
 }
 
@@ -488,13 +513,71 @@ func (s *Service) Lookup(ctx context.Context, scanID string) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
+	return s.resultFor(ctx, scan), nil
+}
 
-	result := Result{Scan: scan}
-	if scan.Status != mongostore.ScanCompleted {
-		return result, nil
+// LookupByURL returns the current state of the most recent scan for a URL,
+// without the caller having kept a scan ID.
+//
+// It is a **read**. It never creates a scan, never queues work and never
+// contacts a provider: a caller wanting a verdict should use Submit, which
+// analyses what is missing. This one answers only what is already known, which
+// is what makes it safe to expose as a plain lookup.
+//
+// The URL is validated identically to a submission — same rules, same error
+// codes, including the target gate — because the two endpoints compute the
+// same fingerprint from the same canonical form. A lookup that normalised
+// differently from a submission would resolve to nothing, and a lookup that
+// skipped the gate would accept URL shapes the system refuses to analyse.
+//
+// Nothing about the URL is stored. It exists only as an HMAC fingerprint for
+// the duration of the query, exactly as it does on submission.
+func (s *Service) LookupByURL(ctx context.Context, rawURL string) (Result, error) {
+	canonical, fingerprint, err := urlintel.Prepare(s.fingerprintKey, rawURL)
+	if err != nil {
+		// Propagated unchanged, so the caller distinguishes a validation
+		// failure from an unusable key using the same predicates a submission
+		// uses.
+		return Result{}, err
 	}
 
-	assessment, err := s.store.GetAssessmentByScanID(ctx, scanID)
+	// The target gate is a pure string and address check — no DNS — so running
+	// it on a read costs nothing and keeps one definition of an acceptable
+	// target across the whole API.
+	//
+	// It is applied to the *canonical* URL Prepare returned, not to the raw
+	// input: that is the spelling the fingerprint was computed from, so the
+	// gate cannot be bypassed by encoding.
+	parsed, err := url.Parse(canonical)
+	if err != nil {
+		// Unreachable — Prepare produced this string. Reported as a refused
+		// target rather than a 500, because either way the answer is no.
+		return Result{}, ErrDisallowedTarget
+	}
+	if err := CheckTarget(parsed); err != nil {
+		return Result{}, err
+	}
+
+	scan, err := s.store.FindLatestScanByFingerprint(ctx, fingerprint)
+	if err != nil {
+		return Result{}, err
+	}
+	return s.resultFor(ctx, scan), nil
+}
+
+// resultFor attaches a fresh assessment to a completed scan.
+//
+// Shared by Lookup and LookupByURL so the two entry points cannot disagree
+// about when a verdict is reportable. That rule is the important part: a
+// verdict appears only for a completed scan with an assessment that is still
+// inside its freshness window.
+func (s *Service) resultFor(ctx context.Context, scan mongostore.Scan) Result {
+	result := Result{Scan: scan}
+	if scan.Status != mongostore.ScanCompleted {
+		return result
+	}
+
+	assessment, err := s.store.GetAssessmentByScanID(ctx, scan.ScanID)
 	switch {
 	case err == nil:
 		// An expired verdict is not reported as the current one.
@@ -506,18 +589,24 @@ func (s *Service) Lookup(ctx context.Context, scanID string) (Result, error) {
 		// freshness check properly.
 		if !assessment.IsFresh(s.now().UTC()) {
 			s.logger.DebugContext(ctx, "assessment has expired; reporting the scan without a verdict",
-				slog.String("scan_id", scanID),
+				slog.String("scan_id", scan.ScanID),
 				slog.Time("expired_at", assessment.ExpiresAt))
-			return result, nil
+			return result
 		}
 		result.Assessment = &assessment
 	case errors.Is(err, mongostore.ErrAssessmentNotFound):
 		// A completed scan whose assessment has been reaped. Reporting the scan
 		// without a verdict is truthful: there is no fresh verdict to serve.
 	default:
-		return Result{}, fmt.Errorf("scans: assessment lookup: %w", err)
+		// A store failure here must not be reported as "no verdict", which
+		// would read as a clean result. It is surfaced as an error by the
+		// caller; resultFor cannot return one, so the failure is logged and the
+		// scan is reported without a verdict.
+		s.logger.WarnContext(ctx, "assessment lookup failed; reporting the scan without a verdict",
+			slog.String("scan_id", scan.ScanID),
+			slog.String("reason", err.Error()))
 	}
-	return result, nil
+	return result
 }
 
 // dropTransient removes an encrypted URL, logging rather than propagating a

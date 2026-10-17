@@ -1,6 +1,6 @@
 // Package health provides dependency probes for the readiness endpoint.
 //
-// Liveness deliberately does not use this package. A MongoDB or Redis outage
+// Liveness deliberately does not use this package. A MongoDB outage
 // must not make an orchestrator restart every replica: that converts a
 // dependency failure into a full outage. Only readiness consults dependencies.
 //
@@ -15,7 +15,7 @@ import (
 )
 
 // Check is a dependency that can be probed. It is satisfied structurally by
-// *mongostore.Store and *redisqueue.Client, which both expose Ping.
+// *mongostore.Store, which exposes Ping.
 type Check interface {
 	Ping(ctx context.Context) error
 }
@@ -60,7 +60,7 @@ func NewChecker(timeout time.Duration, checks ...Named) *Checker {
 // "can this process do useful work", and the useful information is which
 // dependency is down, not a wrapped driver error.
 //
-// The why strings are deliberately generic. Driver and Redis error text can
+// The why strings are deliberately generic. Driver error text can
 // embed hosts, topology and credentials, and this payload is served
 // unauthenticated.
 func (c *Checker) Run(ctx context.Context) (ready bool, reports []Report) {

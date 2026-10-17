@@ -19,8 +19,10 @@ const (
 // Index names, so EnsureIndexes is idempotent and a mismatch is identifiable.
 const (
 	idxScansUniqueActive    = "uniq_active_scan"
+	idxScansFingerprintNew  = "by_fingerprint_recent"
 	idxScansStatusUpdated   = "by_status_updated"
 	idxScansProviderScanID  = "by_provider_scan_id"
+	idxScansClaimable       = "by_claimable"
 	idxAssessmentsExpiresAt = "ttl_expires_at"
 	idxAssessmentsHostname  = "by_hostname"
 	idxAssessmentsDomain    = "by_domain"
@@ -64,10 +66,33 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 				}),
 		},
 		{
+			// Backs `POST /api/v1/get-url`, which resolves a URL to its most
+			// recent scan. The partial index above cannot serve it: that one
+			// only contains active scans, and this query asks for the newest of
+			// any status. Without this index the lookup degrades to a collection
+			// scan, which is O(history) for a URL scanned many times.
+			Keys:    bson.D{{Key: "url_fingerprint", Value: 1}, {Key: "created_at", Value: -1}},
+			Options: options.Index().SetName(idxScansFingerprintNew),
+		},
+		{
 			// Job recovery and operational queries: "what is stuck, and since
 			// when". Ordered by updated_at so the stalest surfaces first.
 			Keys:    bson.D{{Key: "status", Value: 1}, {Key: "updated_at", Value: 1}},
 			Options: options.Index().SetName(idxScansStatusUpdated),
+		},
+		{
+			// The work-claiming query. Claimable means: an active status, due
+			// (available_at), and either unclaimed or holding a lapsed lease.
+			//
+			// This is the only index whose miss would hurt correctness rather
+			// than merely latency — without it every consumer poll is a
+			// collection scan over all history, and claims get slower forever.
+			Keys: bson.D{
+				{Key: "status", Value: 1},
+				{Key: "available_at", Value: 1},
+				{Key: "lease_expires_at", Value: 1},
+			},
+			Options: options.Index().SetName(idxScansClaimable),
 		},
 		{
 			// Lets a restarted worker find an in-flight submission by the

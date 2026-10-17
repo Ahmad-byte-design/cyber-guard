@@ -188,7 +188,7 @@ func TestNilProviderIsSafe(t *testing.T) {
 	}
 }
 
-// Concurrent use must be safe: several worker goroutines share one provider.
+// Concurrent use must be safe: several runner goroutines share one provider.
 func TestLocalIsConcurrencySafe(t *testing.T) {
 	t.Parallel()
 

@@ -7,17 +7,20 @@
 
 | Service | Image | Published | Purpose |
 |---|---|---|---|
-| `backend` | built from `server/` | `8080:8080` | JSON API |
-| `worker` | same image, different entrypoint | none | Consumes the scan queue: submits, polls, caches verdicts |
+| `backend` | built from `server/` | `8080:8080` | JSON API **and** the scan runner |
 | `migrate` | same image, different entrypoint | none | One-shot schema step: creates indexes, then exits |
-| `mongodb` | `mongo:9.0` | **none** | Authoritative store |
-| `redis` | `redis:8-alpine` | **none** | Optional queue/cache ([ADR 0003](decisions/0003-asynchronous-analysis-jobs.md)) |
+| `mongodb` | `mongo:9.0` | **none** | Authoritative store **and work queue** |
 | `go` | `golang:1.27-alpine` | none | Dev toolchain: build, test, vet, format |
 
-MongoDB and Redis publish **no host ports**. Containers reach them as
-`mongodb:27017` and `redis:6379` on the Compose network. Publishing them would
-expose an unauthenticated datastore to the host and anything else on the
-network.
+There are only two long-running services. The `worker` service and the `redis`
+service are gone: job delivery moved into the API as goroutines and the `scans`
+collection became the queue
+([ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md)). One image,
+one process, one datastore.
+
+MongoDB publishes **no host ports**. Containers reach it as `mongodb:27017` on
+the Compose network. Publishing it would expose an unauthenticated datastore to
+the host and anything else on the network.
 
 ## 2. Quick start
 
@@ -38,16 +41,23 @@ The API is on <http://localhost:8080>.
 | Start / rebuild | `docker compose up -d --build` |
 | Stop | `docker compose down` |
 | Stop and delete all data | `docker compose down -v` |
-| Follow API logs | `docker compose logs -f backend` |
+| Follow API and scan logs | `docker compose logs -f backend` |
 | Run tests | `docker compose run --rm go go test ./...` |
 | Race detector | `docker compose run --rm go go test -race ./...` |
+| Integration tests | `docker compose up -d mongodb` then `docker compose run --rm go go test -tags integration ./...` |
 | Vet | `docker compose run --rm go go vet ./...` |
 | Format | `docker compose run --rm go gofmt -w .` |
 | Coverage | `docker compose run --rm go go test -coverpkg=./... -coverprofile=/src/coverage.out ./...` |
+| Re-run the schema migration | `docker compose run --rm migrate` |
+| Check the schema without changing it | `docker compose run --rm migrate -verify` |
 | Build a binary | `docker compose run --rm go go build -o bin/api ./cmd/api` |
 | Check the version stamp | `docker compose run --rm --entrypoint cyberguard-api backend -version` |
 
-`go test -race` is worth making the default locally: the worker is
+Integration tests need **only** `mongodb`. Rate-limit tests are not in that set:
+the counters are in-process, so those are ordinary unit tests and need no
+datastore at all.
+
+`go test -race` is worth making the default locally: the scan runner is
 concurrency-heavy, and the claim path is exactly where races hide.
 
 ## 4. Build
@@ -60,7 +70,11 @@ concurrency-heavy, and the claim path is exactly where races hide.
 RUN CGO_ENABLED=0 GOOS=linux go build \
         -trimpath \
         -ldflags="-s -w -X main.version=${VERSION} ..." \
-        -o /out/api ./cmd/api
+        -o /out/api     ./cmd/api \
+ && CGO_ENABLED=0 GOOS=linux go build \
+        -trimpath \
+        -ldflags="-s -w" \
+        -o /out/migrate ./cmd/migrate
 ```
 
 - `CGO_ENABLED=0` removes the libc dependency, which is what allows the binary
@@ -68,6 +82,11 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
 - `-trimpath` removes local filesystem paths: reproducible builds, and no
   directory layout leaks into the binary.
 - `-s -w` drop the symbol table and DWARF data.
+
+The image carries exactly two binaries: `cyberguard-api` and
+`cyberguard-migrate`. `cyberguard-worker` used to be the third; it is gone,
+because the scan runner is goroutines inside the API and there is nothing
+extra to ship or keep in sync.
 
 **Stage 2** — `alpine:3.22` with `ca-certificates` (required for outbound TLS
 to the provider) and `tzdata`. The service runs as an unprivileged user
@@ -90,28 +109,30 @@ history even if a later layer unsets it. Secrets arrive at runtime through
 |---|---|---|
 | `backend` | `GET /health/live` via `wget` | 30s |
 | `mongodb` | `mongosh --eval "db.adminCommand('ping').ok"` | 10s |
-| `redis` | `redis-cli ping` | 10s |
-| `worker` | **disabled** | — |
+| `migrate` | **disabled** | — |
 
-`backend` and `worker` both declare
-`depends_on: { mongodb: { condition: service_healthy }, redis: … }`, so
-Compose holds them until the datastores answer. Starting the API before MongoDB
-is ready produces a crash loop and a misleading "database down" alert.
+`backend` declares
+`depends_on: { mongodb: { condition: service_healthy } }` plus
+`migrate: { condition: service_completed_successfully }`, so Compose holds it
+until the datastore answers *and* the schema step has succeeded. Starting the
+API before MongoDB is ready produces a crash loop and a misleading "database
+down" alert.
 
-**Why the worker's health check is disabled:** the image's `HEALTHCHECK`
-probes the API's HTTP listener on `:8080`. The worker runs no listener, so
-inheriting that check marks it permanently unhealthy. It must be overridden
-until the worker exposes its own liveness signal.
+**Why the `migrate` health check is disabled:** the image's `HEALTHCHECK`
+probes the API's HTTP listener on `:8080`. `migrate` is a one-shot program that
+never starts a listener, so inheriting that check marks it permanently
+unhealthy. It is not a service anyone waits on — Compose waits on its *exit
+code*. There is no second long-running process needing its own override,
+because there is no second process.
 
 ## 6. Failure behaviour
 
 | Failure | Observed behaviour |
 |---|---|
-| MongoDB down | `backend` exits or readiness fails; Compose restart policy restarts it. Jobs already claimed sit until their lease lapses, then another worker reclaims them |
-| Redis down | `backend` unaffected — MongoDB is the source of truth. The `go` service is unaffected |
+| MongoDB down | `backend` exits or readiness fails; Compose restart policy restarts it. Scans already claimed sit until their lease lapses, then they are claimed again — the lease is the recovery mechanism, so nothing is stranded |
 | Provider down | Readiness reports a degraded `provider` sub-check, not a global `503`. Cached reads keep working |
 | HMAC key missing | Readiness `503`; `check-url` `503 not_ready`; the API still serves liveness |
-| Worker down | Scans stay `queued`; the API still answers cached reads |
+| API restarts | Rate-limit counters reset, because they are in-process and there is no second store to lose. Limits are therefore per replica; the arithmetic, the `X-RateLimit-*` headers and the fail-closed contract are unchanged |
 
 ## 7. Known environment constraint: MongoDB 9.x
 
@@ -136,18 +157,22 @@ the pin explicit rather than floating on `mongo:latest`.
 
 | Volume | Holds | Survives `down`? |
 |---|---|---|
-| `mongo-data` | All CyberGuard collections | Yes |
-| `redis-data` | Redis AOF | Yes |
+| `mongo-data` | All CyberGuard collections, **including queued work** | Yes |
 | `.cache/go-build` | Go build cache | Yes (host bind mount) |
 | `.cache/go-mod` | Module cache | Yes (host bind mount) |
 
-`docker compose down -v` destroys the databases. **Development volumes are not
+`redis-data` is gone with the `redis` service. Note what `mongo-data` now also
+carries: because the scan document *is* the job, a scan submitted but not yet
+analysed lives in the same volume as the verdicts. That is the durability
+guarantee — deleting the volume deletes pending work, not just cached answers.
+
+`docker compose down -v` destroys the database. **Development volumes are not
 a backup.** To reset to a clean state during development, that is the intended
 command; in production it would be a data-loss event.
 
-MongoDB and Redis run without authentication, which is acceptable only because
-they are unreachable from outside the Compose network. Do not add a published
-port to debug locally — use `docker compose exec mongodb mongosh` instead.
+MongoDB runs without authentication, which is acceptable only because it is
+unreachable from outside the Compose network. Do not add a published port to
+debug locally — use `docker compose exec mongodb mongosh` instead.
 
 ## 9. File ownership
 
@@ -169,7 +194,8 @@ The Compose file is for local development. Before production:
 - Enable MongoDB authentication and replica set if durability matters.
 - Replace the compose restart policies with the orchestrator's.
 - Build images in CI and scan them; do not build on the host.
-- Keep `mongodb` and `redis` internal, exactly as here.
+- Keep `mongodb` internal, exactly as here — it is now the only datastore and
+  it also holds unanalysed work, so its blast radius is larger than it was.
 
 ## 11. `.dockerignore`
 
@@ -186,7 +212,7 @@ copied into an intermediate layer and remain in the image history.
 ## The `migrate` service
 
 `docker compose up` starts `migrate`, waits for it to exit successfully, and
-only then starts the API and worker.
+only then starts the API.
 
 It exists because an unmigrated database **fails silently rather than loudly**.
 Without its indexes:
@@ -194,9 +220,15 @@ Without its indexes:
 | Missing index | What quietly stops being true |
 |---|---|
 | `uniq_active_scan` (partial unique) | "One provider submission per URL". Concurrent requests create duplicate scans and duplicate submissions — and no log line looks wrong |
-| `ttl_expires_at` on `transient_urls` | Encrypted URLs are never reaped after a worker crash |
+| `by_claimable` on `scans` | The scan runner cannot find work. Every claim degrades into a collection scan, and under load queued scans are not picked up at all |
+| `ttl_expires_at` on `transient_urls` | Encrypted URLs are never reaped after a crash |
 | `ttl_expires_at` on `assessments` | Verdicts are never deleted at expiry |
 | `by_hostname` / `by_domain` / `by_scan_id` | Every verdict lookup becomes a collection scan |
+
+`by_claimable` (`{status, available_at, lease_expires_at}`) is the index the
+queue itself rests on, and it is the one whose absence would look least like a
+failure: the service starts, submits scans, accepts them, and simply never
+analyses them.
 
 This was a real defect, found by running the API end to end rather than by any
 test: the repository tests call `EnsureIndexes` in their own setup, so they

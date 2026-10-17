@@ -11,13 +11,17 @@ import (
 	"time"
 
 	"cyberguard/server/internal/platform/mongostore"
-	"cyberguard/server/internal/platform/redisqueue"
 	"cyberguard/server/internal/providers"
 	"cyberguard/server/internal/verdicts"
 )
 
-// Worker-side scan execution: claiming jobs, submitting to the provider,
-// polling, persisting verdicts, and recovering work after a crash.
+// Scan execution: claiming scans, submitting to the provider, polling,
+// persisting verdicts, and recovering work after a crash.
+//
+// These run in the API process. They were a separate binary driven by a Redis
+// queue; see ADR 0019 for why that is no longer the case. Nothing else in the
+// package needed to change, which is the strongest evidence that the split was
+// a deployment choice rather than a design requirement.
 
 // Safe, low-cardinality error codes recorded on the scan.
 //
@@ -100,10 +104,7 @@ func (s *Service) runConsumer(ctx context.Context, id int) {
 		job, err := s.queue.Claim(ctx, s.claimBlock)
 
 		switch {
-		case errors.Is(err, redisqueue.ErrNoJob):
-			continue
-		case errors.Is(err, redisqueue.ErrJobInvalid):
-			logger.Warn("dropping malformed queue message")
+		case errors.Is(err, ErrNoJob):
 			continue
 		case err != nil:
 			logger.Warn("claim failed; backing off", slog.String("reason", err.Error()))
@@ -115,6 +116,20 @@ func (s *Service) runConsumer(ctx context.Context, id int) {
 
 		backoff.reset()
 		s.Process(ctx, job.ScanID)
+
+		// Hand the lease back rather than waiting for it to lapse.
+		//
+		// A scan that ended in a terminal status is no longer claimable, so the
+		// release is a no-op for it. For one that did not — a poll deadline, a
+		// dropped dependency, a shutdown mid-job — releasing now means a retry
+		// starts immediately instead of idling for a whole lease. The worst case
+		// if this call fails is one lease of extra latency, which is why the
+		// failure is logged rather than escalated.
+		if err := s.queue.Release(ctx, job.ScanID); err != nil && ctx.Err() == nil {
+			logger.Debug("releasing a lease failed; it will lapse on its own",
+				slog.String("scan_id", job.ScanID),
+				slog.String("reason", err.Error()))
+		}
 	}
 
 	logger.Debug("consumer exiting")
@@ -123,7 +138,7 @@ func (s *Service) runConsumer(ctx context.Context, id int) {
 // runSupervisor promotes due retries and re-enqueues stalled scans.
 //
 // These two run on one goroutine because both are interval work over the whole
-// queue; giving each its own goroutine would multiply MongoDB and Redis queries
+// queue; giving each its own goroutine would multiply MongoDB queries
 // for no gain.
 func (s *Service) runSupervisor(ctx context.Context) {
 	logger := s.logger
@@ -155,11 +170,14 @@ func (s *Service) runSupervisor(ctx context.Context) {
 
 // Reconcile re-enqueues scans that are active but no longer progressing.
 //
-// This is the recovery mechanism for every non-atomic gap in the workflow:
-// MongoDB recorded a scan but Redis never received it, a message was lost to a
-// Redis restart, or a worker crashed mid-job. In all three cases MongoDB still
-// holds an active scan with a stale updated_at, and re-enqueueing is always
-// safe because processing a scan twice is a no-op.
+// This is the recovery mechanism for a consumer that stopped making progress:
+// MongoDB holds an active scan whose updated_at has gone stale. Re-enqueueing is
+// always safe because processing a scan twice is a no-op.
+//
+// It covers a narrower set of failures than it used to. There is no longer a
+// window between "scan recorded" and "job delivered" to be lost in, because the
+// scan document *is* the job — so the reconciler's job is now purely to recover
+// work whose consumer died, alongside the lease expiry in mongostore.
 //
 // A scan that has exhausted its attempts is failed outright rather than
 // re-enqueued. Without that, a permanently failing URL would be retried
@@ -317,7 +335,7 @@ func (s *Service) submit(ctx context.Context, scan *mongostore.Scan) (string, er
 	//
 	// Only the scheme and path are taken; the query string is dropped here and
 	// never reaches the database.
-	scheme, path, _ := splitTarget(rawURL)
+	scheme, port, path, _ := splitTarget(rawURL)
 
 	submitCtx, cancel := context.WithTimeout(ctx, s.providerTimeout)
 	submission, err := s.provider.SubmitURL(submitCtx, rawURL)
@@ -332,7 +350,7 @@ func (s *Service) submit(ctx context.Context, scan *mongostore.Scan) (string, er
 	}
 
 	if scheme != "" {
-		if err := s.store.RecordScanTarget(ctx, scan.ScanID, scheme, path, false); err != nil {
+		if err := s.store.RecordScanTarget(ctx, scan.ScanID, scheme, port, path, false); err != nil {
 			s.logger.Warn("recording the scan target detail failed",
 				slog.String("scan_id", scan.ScanID),
 				slog.String("reason", err.Error()))
@@ -344,6 +362,7 @@ func (s *Service) submit(ctx context.Context, scan *mongostore.Scan) (string, er
 		// in-memory one is still the pre-submission scan, so the assessment
 		// silently gets an empty path and no rule is ever generated.
 		scan.Scheme = scheme
+		scan.Port = port
 		scan.PathPrefix = path
 	}
 
@@ -365,6 +384,20 @@ func (s *Service) submit(ctx context.Context, scan *mongostore.Scan) (string, er
 		string(submission.State), submission.EnvironmentID); err != nil {
 		return "", &submitError{code: codeSubmissionNotRecorded, err: err, retryable: true}
 	}
+
+	// Mirror the provider identifiers onto the in-memory copy, for the same
+	// reason the target detail is mirrored above.
+	//
+	// process() continues with this struct and passes it to poll(), which
+	// eventually calls complete(), which builds the assessment from it. MongoDB
+	// now holds the job id but this copy is still the pre-submission scan, so on
+	// a first-attempt submission the assessment would record an empty
+	// provider_scan_id — the audit trail would point at a scan with no handle,
+	// and a later diagnosis could not re-derive which provider job produced the
+	// verdict. Only a resumed scan would have carried it, which is why this was
+	// invisible: the recovery path masked the common path.
+	scan.ProviderScanID = submission.ProviderScanID
+	scan.ProviderSubmissionID = submission.ProviderSubmissionID
 
 	if _, err := s.store.UpdateScanStatus(ctx, scan.ScanID, mongostore.ScanRunning, ""); err != nil && ctx.Err() == nil {
 		s.logger.Warn("marking a scan running failed",
@@ -572,9 +605,9 @@ func (s *Service) complete(ctx context.Context, scan mongostore.Scan, analysis p
 	// The query string is never carried. It routinely holds session tokens and
 	// identifiers, and persisting those would undo the point of the fingerprint.
 	// See ADR 0018 for the trade-off this represents.
-	scheme, path := "", ""
+	scheme, port, path := "", "", ""
 	if verdict == verdicts.Malicious {
-		scheme, path = scan.Scheme, scan.PathPrefix
+		scheme, port, path = scan.Scheme, scan.Port, scan.PathPrefix
 	}
 
 	assessment, err := s.store.PutAssessment(ctx, mongostore.Assessment{
@@ -583,6 +616,7 @@ func (s *Service) complete(ctx context.Context, scan mongostore.Scan, analysis p
 		Hostname:          scan.Hostname,
 		RegistrableDomain: scan.RegistrableDomain,
 		Scheme:            scheme,
+		Port:              port,
 		PathPrefix:        path,
 		Verdict:           verdict,
 		Provider:          s.providerName,
@@ -604,7 +638,7 @@ func (s *Service) complete(ctx context.Context, scan mongostore.Scan, analysis p
 	// The scan record is the long-lived audit trail. Once the assessment
 	// carries whatever rule detail the verdict justified, the scan no longer
 	// needs it, so it is cleared rather than kept indefinitely.
-	if err := s.store.RecordScanTarget(ctx, scan.ScanID, "", "", true); err != nil && ctx.Err() == nil {
+	if err := s.store.RecordScanTarget(ctx, scan.ScanID, "", "", "", true); err != nil && ctx.Err() == nil {
 		s.logger.Warn("clearing the scan target detail failed",
 			slog.String("scan_id", scan.ScanID),
 			slog.String("reason", err.Error()))
@@ -743,7 +777,7 @@ func (b *backoff) reset() { b.n = 0 }
 
 // sleepCtx waits for d, reporting false if ctx was cancelled first.
 //
-// Every wait in the worker goes through it. A bare time.Sleep would keep a
+// Every wait in the runner goes through it. A bare time.Sleep would keep a
 // shutdown blocked for up to a full poll interval, and would make a context
 // cancellation invisible to the polling loop.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -761,8 +795,12 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// splitTarget extracts the scheme and path from a canonical URL, dropping the
-// query string and fragment.
+// splitTarget extracts the scheme, port and path from a canonical URL, dropping
+// the query string and fragment.
+//
+// The port is kept because dropping it silently broadens a rule: an assessment
+// of https://host.test:8443/login must not produce a rule covering
+// https://host.test/login, which nobody assessed.
 //
 // The query is discarded rather than stored because it routinely carries
 // session tokens and identifiers. Persisting those would undo the point of the
@@ -770,17 +808,17 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 //
 // A URL with no path yields "/", so a rule built from it still has a stable,
 // filterable shape.
-func splitTarget(canonical string) (scheme, path string, ok bool) {
+func splitTarget(canonical string) (scheme, port, path string, ok bool) {
 	parsed, err := url.Parse(canonical)
 	if err != nil {
-		return "", "", false
+		return "", "", "", false
 	}
 	if parsed.Scheme == "" {
-		return "", "", false
+		return "", "", "", false
 	}
 	p := parsed.EscapedPath()
 	if p == "" {
 		p = "/"
 	}
-	return parsed.Scheme, p, true
+	return parsed.Scheme, parsed.Port(), p, true
 }

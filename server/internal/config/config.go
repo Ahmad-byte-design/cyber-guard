@@ -51,17 +51,15 @@ type Config struct {
 	LogLevel  string
 	LogFormat string
 
-	// MongoDB — the authoritative store.
+	// MongoDB — the authoritative store, and the work queue.
+	//
+	// One datastore, not two. Redis previously provided job delivery and
+	// rate-limit counters; both are gone, and MongoDB absorbed the first while
+	// rate limits became per-process. See docs/decisions/0013-durable-jobs-and-url-privacy.md.
 	MongoURI            string
 	MongoDatabase       string
 	MongoConnectTimeout time.Duration
 	MongoPingTimeout    time.Duration
-
-	// Redis — scan queue and rate-limit counters.
-	RedisAddr        string
-	RedisPassword    string
-	RedisDB          int
-	RedisPingTimeout time.Duration
 
 	// Readiness probes.
 	HealthCheckTimeout time.Duration
@@ -127,6 +125,21 @@ type Config struct {
 	// WorkerClaimBlock is how long a consumer waits for work before re-reading
 	// its cancellation. It sets shutdown latency.
 	WorkerClaimBlock time.Duration
+	// WorkerClaimPollGap is the pause between empty claims.
+	//
+	// MongoDB has no blocking claim primitive, so an idle consumer polls. This
+	// bounds how hard "no work" queries the database; it is separate from the
+	// claim block because the two answer different questions — how long to wait
+	// for work, and how hard to look while waiting.
+	WorkerClaimPollGap time.Duration
+	// ClaimLeaseHeadroom is added to the poll deadline to derive a claim lease.
+	//
+	// The lease must outlive the longest possible unit of work. If it did not, a
+	// second consumer could claim a scan whose provider analysis is still
+	// running, and on the submission path that is the difference between
+	// polling an existing job and submitting the URL a second time. It is
+	// validated rather than configured, so no value can be set that breaks that.
+	ClaimLeaseHeadroom time.Duration
 	// AssessmentTTL is how long a verdict may be served as fresh.
 	AssessmentTTL time.Duration
 	// ScanMaxAttempts bounds recoveries before a scan is failed outright.
@@ -142,6 +155,28 @@ type Config struct {
 	RULESET_MIN_CORROBORATION_PREFIX int
 	RULESET_MIN_CORROBORATION_DOMAIN int
 	RULESET_MAX_RULES                int
+
+	// RULESET_MAX_REGEX_RULES caps rules built on a regular expression.
+	//
+	// Chrome caps these at 1000 per ruleset, far below the total rule limit, and
+	// exceeding it makes Chrome ignore the ruleset rather than reject it — a
+	// client appears up to date while carrying no protection.
+	RULESET_MAX_REGEX_RULES int
+
+	// RULESET_ACTION selects what an emitted rule does: "block" or "redirect".
+	RULESET_ACTION string
+
+	// RULESET_REDIRECT_PATH is the extension-relative page a redirect rule sends
+	// the user to. Validated as an extension path, so a misconfiguration cannot
+	// turn a redirect into an off-site navigation.
+	RULESET_REDIRECT_PATH string
+
+	// RULESET_RESOURCE_PROFILE selects which request types a rule applies to:
+	// "navigation", "navigation_and_active" or "all_subresources".
+	RULESET_RESOURCE_PROFILE string
+
+	// RULESET_PRIORITY is the DNR priority every emitted rule carries.
+	RULESET_PRIORITY int
 	// RulesetRebuildInterval bounds how often the worker rebuilds, so a burst
 	// of scans does not trigger one rebuild each.
 	RulesetRebuildInterval time.Duration
@@ -160,8 +195,6 @@ func Load() (Config, error) {
 		MongoURI:              env("MONGODB_URI", "mongodb://mongodb:27017"),
 		MongoDatabase:         env("MONGODB_DATABASE", "cyberguard"),
 		AnalysisProvider:      env("ANALYSIS_PROVIDER", ProviderHybridAnalysis),
-		RedisAddr:             env("REDIS_ADDR", "redis:6379"),
-		RedisPassword:         secret("REDIS_PASSWORD"),
 		HybridAnalysisBaseURL: env("HYBRID_ANALYSIS_BASE_URL", "https://hybrid-analysis.com/api/v2"),
 		HybridAnalysisAPIKey:  secret("HYBRID_ANALYSIS_API_KEY"),
 		URLFingerprintHMACKey: secret("URL_FINGERPRINT_HMAC_KEY"),
@@ -191,13 +224,13 @@ func Load() (Config, error) {
 	if c.MongoPingTimeout, err = envDuration("MONGODB_PING_TIMEOUT", 5*time.Second); err != nil {
 		return Config{}, err
 	}
-	if c.RedisPingTimeout, err = envDuration("REDIS_PING_TIMEOUT", 3*time.Second); err != nil {
+	if c.WorkerClaimPollGap, err = envDuration("WORKER_CLAIM_POLL_GAP", 250*time.Millisecond); err != nil {
+		return Config{}, err
+	}
+	if c.ClaimLeaseHeadroom, err = envDuration("CLAIM_LEASE_HEADROOM", 30*time.Second); err != nil {
 		return Config{}, err
 	}
 	if c.HealthCheckTimeout, err = envDuration("HEALTH_CHECK_TIMEOUT", 2*time.Second); err != nil {
-		return Config{}, err
-	}
-	if c.RedisDB, err = envInt("REDIS_DB", 0); err != nil {
 		return Config{}, err
 	}
 
@@ -265,6 +298,15 @@ func Load() (Config, error) {
 	if c.RULESET_MAX_RULES, err = envInt("RULESET_MAX_RULES", 5000); err != nil {
 		return Config{}, err
 	}
+	if c.RULESET_MAX_REGEX_RULES, err = envInt("RULESET_MAX_REGEX_RULES", 1000); err != nil {
+		return Config{}, err
+	}
+	c.RULESET_ACTION = strings.ToLower(strings.TrimSpace(env("RULESET_ACTION", "block")))
+	c.RULESET_REDIRECT_PATH = env("RULESET_REDIRECT_PATH", "/locked.html")
+	c.RULESET_RESOURCE_PROFILE = strings.ToLower(strings.TrimSpace(env("RULESET_RESOURCE_PROFILE", "navigation_and_active")))
+	if c.RULESET_PRIORITY, err = envInt("RULESET_PRIORITY", 1); err != nil {
+		return Config{}, err
+	}
 	if c.RulesetRebuildInterval, err = envDuration("RULESET_REBUILD_INTERVAL", 60*time.Second); err != nil {
 		return Config{}, err
 	}
@@ -305,11 +347,17 @@ func (c Config) validate() error {
 	if c.MongoDatabase == "" {
 		return fmt.Errorf("MONGODB_DATABASE must not be empty")
 	}
-	if c.RedisAddr == "" {
-		return fmt.Errorf("REDIS_ADDR must not be empty")
+	if c.WorkerClaimPollGap <= 0 {
+		return fmt.Errorf("WORKER_CLAIM_POLL_GAP must be positive, got %s", c.WorkerClaimPollGap)
 	}
-	if c.RedisDB < 0 {
-		return fmt.Errorf("REDIS_DB must not be negative, got %d", c.RedisDB)
+	// The lease is derived as poll deadline + poll interval + headroom, so a
+	// non-positive headroom could collapse it to the deadline and let a second
+	// consumer claim a scan whose provider analysis is still running. That is the
+	// one misconfiguration with a financial consequence, so it is rejected at
+	// load rather than discovered in production.
+	if c.ClaimLeaseHeadroom <= 0 {
+		return fmt.Errorf("CLAIM_LEASE_HEADROOM must be positive, got %s; a zero headroom "+
+			"would let a claim expire while its scan is still being processed", c.ClaimLeaseHeadroom)
 	}
 	if c.HealthCheckTimeout <= 0 {
 		return fmt.Errorf("HEALTH_CHECK_TIMEOUT must be positive, got %s", c.HealthCheckTimeout)
@@ -359,6 +407,29 @@ func (c Config) validate() error {
 	default:
 		return fmt.Errorf("RULESET_MAX_SCOPE: want exact_url, url_prefix or registrable_domain, got %q",
 			c.RULESET_MAX_SCOPE)
+	}
+	switch c.RULESET_ACTION {
+	case "block", "redirect":
+	default:
+		return fmt.Errorf("RULESET_ACTION: want block or redirect, got %q", c.RULESET_ACTION)
+	}
+	switch c.RULESET_RESOURCE_PROFILE {
+	case "navigation", "navigation_and_active", "all_subresources":
+	default:
+		return fmt.Errorf("RULESET_RESOURCE_PROFILE: want navigation, navigation_and_active or all_subresources, got %q",
+			c.RULESET_RESOURCE_PROFILE)
+	}
+	if c.RULESET_PRIORITY < 1 {
+		return fmt.Errorf("RULESET_PRIORITY must be at least 1, got %d", c.RULESET_PRIORITY)
+	}
+	// Chrome's regex limit is a hard ceiling whose failure mode is silent: the
+	// ruleset is ignored, so a client looks up to date with no protection.
+	if c.RULESET_MAX_REGEX_RULES < 0 {
+		return fmt.Errorf("RULESET_MAX_REGEX_RULES must not be negative, got %d", c.RULESET_MAX_REGEX_RULES)
+	}
+	if c.RULESET_MAX_REGEX_RULES > 1000 {
+		return fmt.Errorf("RULESET_MAX_REGEX_RULES %d exceeds Chrome's documented limit of 1000; "+
+			"Chrome ignores an over-limit ruleset rather than rejecting it", c.RULESET_MAX_REGEX_RULES)
 	}
 	// The corroboration ladder must not weaken as scopes widen: a broader rule
 	// blocking more must never be easier to earn.

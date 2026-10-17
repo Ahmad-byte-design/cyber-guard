@@ -7,33 +7,42 @@
 ```text
 server/
 ├── cmd/
-│   ├── api/                     # package main — wiring only
-│   └── worker/                  # package main — wiring only
+│   ├── api/                     # package main — wiring, plus the scan runner
+│   └── migrate/                 # package main — one-shot index creation
 ├── internal/
 │   ├── config/                  # env loading, validation
-│   ├── app/                     # wiring shared by api and worker
+│   ├── app/                     # shared datastore wiring
 │   ├── logging/                 # slog construction
+│   ├── health/                  # readiness probes (Check interface + Checker)
 │   ├── httpapi/                 # transport: routing, middleware, DTOs
 │   │   └── docs/                # Swagger UI + the embedded contract
 │   ├── urlintel/                # validate · canonicalize · fingerprint · PSL hosts
 │   ├── scans/                   # scan lifecycle: submit · dedup · dispatch · poll · verdict
-│   ├── ratelimit/               # Redis fixed-window counters (ADR 0014)
+│   ├── ratelimit/               # in-process fixed-window counters (ADR 0014)
 │   ├── verdicts/                # CyberGuard verdict vocabulary
 │   ├── memstore/                # in-memory Store/Queue for tests
 │   ├── providers/               # AnalysisProvider contract
 │   │   ├── hybridanalysis/      # real adapter — the only HA-aware package
 │   │   └── mock/                # deterministic fake for tests
 │   └── platform/                # infrastructure implementations
-│       ├── mongostore/          # MongoDB repositories
-│       └── redisqueue/          # scan queue (scan IDs only) + rate-limit storage
+│       ├── mongostore/          # MongoDB repositories + the atomic lease claim
+│       └── mongoqueue/          # the scans collection as the lifecycle's Queue
 └── go.mod
 ```
+
+`cmd/worker` and `platform/redisqueue` were deleted. Job delivery is the
+scans collection claimed by a time-bounded lease, and the consumer is a
+goroutine inside `cmd/api`
+([ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md)). `mongoqueue`
+is the adapter that speaks the lifecycle's `Enqueue`/`Claim`/`PromoteDue`
+vocabulary; the claim query itself lives in `mongostore`, next to the driver
+code that has to express it atomically.
 
 `internal/memstore` is an in-memory implementation of the persistence and queue
 interfaces, not a mock. It reproduces deduplication, AES-256-GCM with the scan
 ID as additional authenticated data, and read-and-delete semantics, because the
 behaviour under test is *ordering* and a call-recording stub cannot express it.
-The integration tests use the real MongoDB and Redis instead.
+The integration tests use the real MongoDB instead.
 
 `go.mod` currently declares `cyberguard/server`, which is not a fetchable
 repository path. It must be derived from the Git remote —
@@ -49,10 +58,10 @@ a provider's wire types.
 
 ```mermaid
 flowchart TD
-    cmdapi[cmd/api] --> httpapi
-    cmdworker[cmd/worker] --> scans
-    cmdworker --> providers
-    cmdworker --> verdicts
+    cmdapi[cmd/api<br/>HTTP · scan runner] --> httpapi
+    cmdapi --> scans
+    cmdapi --> providers
+    cmdapi --> verdicts
 
     httpapi --> scans
     httpapi --> rulesets
@@ -72,13 +81,13 @@ flowchart TD
     subgraph Impl["Implementations (import platform, never the reverse)"]
         hap[providers/hybridanalysis]
         mgs[platform/mongostore]
-        rq[platform/redisqueue]
+        mq[platform/mongoqueue]
         tu[platform/transienturl]
     end
 
     hap -.implements.-> iface
     mgs -.implements.-> stores
-    rq -.implements.-> stores
+    mq -.implements.-> stores
     tu -.implements.-> stores
 
     urlintel -.-> stdlib[stdlib only<br/>+ x/net/publicsuffix]
@@ -107,7 +116,7 @@ Go interfaces are implicit. `*hybridanalysis.Client` satisfies
 
 ## 3. Package responsibilities
 
-### `cmd/api`, `cmd/worker`
+### `cmd/api`, `cmd/migrate`
 
 Parse flags, load config, construct dependencies in a deliberate order, start,
 handle signals, exit. **No business logic.**
@@ -116,8 +125,15 @@ handle signals, exit. **No business logic.**
 - No `init()` functions for wiring.
 - Everything testable lives behind `run(ctx, deps) error`.
 
-Both binaries share wiring code. Factor it into a small `internal/app` package
-once the second constructor exceeds a handful of lines — not before.
+`cmd/api` additionally starts the scan runner as background goroutines and
+stops it through the same context. That is the only difference in kind, and it
+is deliberate: analysis must not hold an HTTP request open, and running it on
+its own goroutines decouples the two without needing a second process to
+decouple them.
+
+`cmd/migrate` has no dependencies beyond the store. It exists as a separate
+program so that index creation is an explicit step rather than something that
+happens, or silently fails to happen, on every boot.
 
 ### `internal/config`
 
@@ -200,6 +216,12 @@ The application core. Owns the lifecycle:
 - Enqueue a job.
 - Drive state transitions.
 
+It also owns the **consumer loop**, which runs on its own goroutines inside
+`cmd/api`: claim, submit, poll, persist, release. That placement is the whole
+point of [ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md) —
+the decoupling that matters is between the request and the analysis, not
+between two processes.
+
 Knows nothing about HTTP, and nothing about the provider's wire format.
 
 ### `internal/verdicts`
@@ -232,13 +254,21 @@ per-client and per-fingerprint rate limits, global quotas, and concurrency
 semaphores.
 
 Pure policy — it decides whether a request is allowed and with what
-`Retry-After`. The counters it consults come from Redis, so this package does
-not import a driver.
+`Retry-After`. The counters it consults are in-process maps behind that
+interface, so this package imports no datastore driver and its tests need no
+service of any kind.
 
-Quota exhaustion **fails closed**. If the counter store is unreachable, the
-controls cannot be evaluated, so submissions stop rather than proceed
-unguarded. That is a deliberate availability sacrifice: an unguarded endpoint
-spends money.
+Quota exhaustion **fails closed**. `ErrUnavailable` remains a distinguished
+outcome even though an in-process counter has nothing to be unavailable, because
+callers must be able to tell "the limit was hit" (429) from "the limiter is
+broken" (503). A shared counter store would need that path again, and the
+interface must not have to change to provide it.
+
+The cost of in-process counters is real and documented rather than hidden: they
+are per-replica and they reset on restart, so the configured limits are
+per-process. That is acceptable for a single replica and unacceptable against a
+hard financial limit — which is the condition for moving the counters back to a
+shared store without changing anything above this package.
 
 ### `internal/providers/hybridanalysis`
 
@@ -248,10 +278,16 @@ wire types, retries, polling, and error mapping.
 Must not leak provider field names upward. If `verdicts` ever references a
 provider JSON tag, the boundary has been breached.
 
-### `internal/platform/mongostore`, `internal/platform/queue`
+### `internal/platform/mongostore`, `internal/platform/mongoqueue`
 
 Infrastructure. Owns connection pooling, index creation, driver-error
 translation, and the atomic claim query.
+
+The claim query belongs in `mongostore` because it must be expressed as a
+single `FindOneAndUpdate` against the driver that stores the documents; the
+lease is stamped in the same operation that selects the scan, which is the only
+way two consumers cannot both win. `mongoqueue` adapts that primitive to the
+lifecycle's `Queue` vocabulary and owns nothing but the translation.
 
 Driver errors become domain errors here, so nothing above this layer ever sees
 `mongo.ErrNoDocuments`.
@@ -297,24 +333,35 @@ type AssessmentStore interface {
     MarkCompleted(ctx context.Context, scanID string, v verdict.Verdict, at time.Time) error
 }
 
-type JobQueue interface {
-    Enqueue(ctx context.Context, job Job) error
-    Claim(ctx context.Context, lease time.Duration) (Job, error)
-    Complete(ctx context.Context, jobID string) error
-    Retry(ctx context.Context, jobID string, nextAttemptAt time.Time, code string) error
+// JobQueue delivers a scan ID and nothing else — there is deliberately no
+// field a URL could travel in, so ADR 0013 cannot be broken by a caller.
+type Queue interface {
+    Enqueue(ctx context.Context, scanID string) error
+    EnqueueRetry(ctx context.Context, scanID string, delay time.Duration) error
+    Claim(ctx context.Context, block time.Duration) (Job, error)
+    PromoteDue(ctx context.Context, limit int) (int, error)
+    Release(ctx context.Context, scanID string) error
 }
 ```
 
 Two methods each. No `Store` interface with fifteen methods that no caller
 uses.
 
+`Claim` returns an expired-or-live **lease**, not a popped message. That is the
+one difference from a broker, and it is what makes several consumers safe
+without coordination: two consumers racing for one scan cannot both win, and a
+consumer that dies holding a claim blocks nothing once the lease lapses.
+
 ## 6. Rejected alternatives
 
 | Alternative | Why not |
 |---|---|
 | Microservices | No scaling or isolation pressure. Adds network failure modes to a system whose hardest problem is already correctness of meaning. Revisit when worker throughput is measured, not assumed. |
+| A second process consuming the queue | The decoupling that mattered was between the request and the analysis. Goroutines inside the API give exactly that, and one fewer deployment unit to coordinate. Restarting the API pauses analysis — the accepted cost, recorded in [ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md) |
+| A separate broker (Redis, SQS) for job delivery | The scan document was already the durable ledger; a broker made it a second source of truth about work the ledger knew about, and the reconciler the permanent tax keeping the two in step |
+| A reconciler that re-enqueues undelivered scans | It existed only to close the window between "scan recorded" and "job delivered". With no separate delivery step there is no window, so nothing can be stranded |
 | Repository base type with 12 methods | Callers need 2–4 methods. A wide interface is satisfied by fakes that hide the behaviour under test. |
-| Events / pub-sub inside the monolith | Adds ordering and delivery guarantees nobody asked for. The queue is already the async boundary. |
+| Events / pub-sub inside the monolith | Adds ordering and delivery guarantees nobody asked for. The scan document is already the async boundary. |
 | ORM for MongoDB | The atomic upsert and claim patterns are the core correctness mechanisms. An ORM hides exactly the semantics that matter here. |
 | `pkg/` exported packages | Nothing outside this module consumes the code. `internal/` is enforced by the compiler. |
 | Elasticsearch | Exact-URL lookup is a keyed document fetch. A search index would add a datastore, an eventual-consistency window and a rebuild path for zero benefit at MVP volume. |
@@ -329,8 +376,9 @@ uses.
 | `internal/app` | ✅ shared datastore wiring | unchanged |
 | `internal/urlnorm` | ✅ validation, canonicalisation, fingerprints | **✅ renamed `internal/urlintel`** + PSL. `host.go` holds `NormalizeHostname`, `RegistrableDomain`, `ParseHost` |
 | `internal/httpapi` | ✅ routes, middleware, RFC 9457, OpenAPI drift check | grow handlers with the pipeline; add rate-limit and auth middleware in Phase 8 |
-| `internal/platform/mongostore` | ✅ **repositories, indexes and transient-URL crypto** | add `host_signals` and `rulesets` — Phase 6/7 |
-| `internal/platform/redisqueue` | ✅ connection, ping, idempotent close | add enqueue, claim and lease — Phase 4 |
+| `internal/platform/mongostore` | ✅ **repositories, indexes and transient-URL crypto** + the atomic lease claim | add `host_signals` and `rulesets` — Phase 6/7 |
+| `internal/platform/mongoqueue` | ✅ adapts `scans` documents to the `Queue` interface | unchanged |
+| `internal/platform/redisqueue` | ⛔ **deleted** — superseded by `mongoqueue` | — |
 | `internal/platform/transienturl` | ✅ shipped inside `platform/mongostore/transienturl.go` | unchanged |
 | `internal/providers` | ✅ contract only (deviation D3) | move the contract into `internal/scans` — Phase 4 |
 | `internal/providers/mock` | ✅ implemented and tested | moves with the contract |
@@ -341,6 +389,10 @@ uses.
 | `internal/verdicts` | ✅ vocabulary, tested | unchanged |
 | `internal/providers/hybridanalysis` | ✅ **implemented and tested** against `httptest` | unchanged; contract fully verified |
 | `internal/ratelimit` | ❌ | new — Phase 8 |
+
+`cmd/worker` is deleted. `cmd/api` keeps the entrypoint and gains the consumer
+loop, so `internal/app` is no longer wiring shared between two binaries — it is
+the wiring for one, shared between the HTTP server and the runner it starts.
 
 `urlnorm` → `urlintel` shipped together with the PSL swap in one change, so
 the rename never existed in a half-finished state where the package was named

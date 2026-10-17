@@ -578,7 +578,7 @@ func TestHealthReadyFailsWhenADependencyIsDown(t *testing.T) {
 		t.Parallel()
 		checker := health.NewChecker(time.Second,
 			health.Named{Name: "mongodb", Check: stubCheck{}},
-			health.Named{Name: "redis", Check: stubCheck{}},
+			health.Named{Name: "provider_registry", Check: stubCheck{}},
 		)
 		rec := do(t, newTestServerWithHealth(t, "k", nil, checker), http.MethodGet, "/health/ready", "", "")
 		if rec.Code != http.StatusOK {
@@ -590,7 +590,7 @@ func TestHealthReadyFailsWhenADependencyIsDown(t *testing.T) {
 		t.Parallel()
 		checker := health.NewChecker(time.Second,
 			health.Named{Name: "mongodb", Check: stubCheck{err: errors.New("dial refused")}},
-			health.Named{Name: "redis", Check: stubCheck{}},
+			health.Named{Name: "provider_registry", Check: stubCheck{}},
 		)
 		rec := do(t, newTestServerWithHealth(t, "k", nil, checker), http.MethodGet, "/health/ready", "", "")
 		if rec.Code != http.StatusServiceUnavailable {
@@ -598,17 +598,18 @@ func TestHealthReadyFailsWhenADependencyIsDown(t *testing.T) {
 		}
 	})
 
-	t.Run("redis down", func(t *testing.T) {
+	t.Run("a registered dependency is down", func(t *testing.T) {
 		t.Parallel()
-		// Redis backs the rate-limit counters. Without it the abuse controls
-		// cannot be evaluated, so the service must stop receiving traffic.
+		// A dependency the readiness probe tracks. If it cannot be reached the
+		// service must stop receiving traffic rather than answer "ready" while
+		// unable to do the work it claims to be ready for.
 		checker := health.NewChecker(time.Second,
 			health.Named{Name: "mongodb", Check: stubCheck{}},
-			health.Named{Name: "redis", Check: stubCheck{err: errors.New("connection refused")}},
+			health.Named{Name: "provider_registry", Check: stubCheck{err: errors.New("connection refused")}},
 		)
 		rec := do(t, newTestServerWithHealth(t, "k", nil, checker), http.MethodGet, "/health/ready", "", "")
 		if rec.Code != http.StatusServiceUnavailable {
-			t.Fatalf("ready with redis down = %d, want 503", rec.Code)
+			t.Fatalf("ready with a dependency down = %d, want 503", rec.Code)
 		}
 	})
 }

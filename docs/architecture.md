@@ -49,9 +49,14 @@ mitigation. See
 
 ## 2. High-level architecture
 
-A modular monolith. One Go module, two binaries (`api`, `worker`) sharing
-`internal/`, with MongoDB as the authoritative store and Redis as the queue and
-rate-limit backend ([ADR 0017](decisions/0017-redis-in-the-mvp.md)).
+A modular monolith. One Go module, **one long-running binary** (`api`) plus a
+one-shot `migrate` tool, with MongoDB as both the authoritative store and the
+work queue. The scan runner is background goroutines inside `api`, not a second
+process ([ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md)).
+
+Redis was removed. It had been the job queue and the rate-limit backend
+([ADR 0017](decisions/0017-redis-in-the-mvp.md), now superseded); the queue is
+the ledger itself and the rate-limit counters are in-process.
 
 ```mermaid
 flowchart TD
@@ -59,11 +64,11 @@ flowchart TD
     EXT -->|GET /api/v1/get-url/{id}| API
     EXT -->|GET /api/v1/get-all?version=N| API
 
-    LIM[rate limit · quota ·<br/>concurrency controls<br/>ADR 0014]
+    LIM[rate limit · quota ·<br/>concurrency controls<br/>ADR 0014 · in-process counters]
 
-    subgraph Process["Go module (path per ADR 0016)"]
+    subgraph Process["Go module (path per ADR 0016) — single process"]
         API[cmd/api<br/>HTTP transport]
-        WKR[cmd/worker<br/>Job consumer]
+        RUN[scan runner<br/>background goroutines]
         subgraph Mod["internal/ business modules"]
             UI[urlintel<br/>validate · canonicalize · fingerprint]
             SC[scans<br/>lifecycle · dedup · state machine]
@@ -77,7 +82,6 @@ flowchart TD
         subgraph Plat["internal/platform"]
             MG[(MongoDB<br/>source of truth)]
             TU[(transient_urls<br/>AES-256-GCM · TTL minutes)]
-            RD[(Redis<br/>queue · rate limits)]
         end
     end
 
@@ -88,12 +92,11 @@ flowchart TD
     SC --> UI
     SC --> MG
     SC --> TU
-    SC --> RD
-    WKR --> RD
-    WKR --> TU
-    WKR --> SC
-    WKR --> PIF
-    WKR --> VD
+    RUN --> MG
+    RUN --> TU
+    RUN --> SC
+    RUN --> PIF
+    RUN --> VD
     VD --> RS
     HAP -.implements.-> PIF
     PIF --> HAP
@@ -103,13 +106,20 @@ flowchart TD
     RS -->|GET /api/v1/get-all| EXT
 ```
 
-Queue payloads carry **scan IDs only**. Raw URLs are encrypted into
+The `scans` collection **is** the queue. A claim is a time-bounded lease on the
+scan document itself: one atomic `FindOneAndUpdate` matches a claimable scan
+(status active, `available_at` due or absent, lease absent or expired) and
+stamps `lease_owner` and `lease_expires_at`, served by the `by_claimable` index.
+There is no second record to keep in step with the ledger, and several replicas
+compete for work safely without coordination.
+
+Job payloads carry **scan IDs only**. Raw URLs are encrypted into
 `transient_urls` and deleted immediately after submission
 ([ADR 0013](decisions/0013-durable-jobs-and-url-privacy.md)).
 
 Trust boundaries are the process edges: the extension is untrusted input, the
-provider is untrusted output, and MongoDB/Redis are trusted infrastructure that
-are never published to the network.
+provider is untrusted output, and MongoDB is trusted infrastructure that is
+never published to the network.
 
 ## 3. URL analysis lifecycle
 
@@ -121,8 +131,7 @@ sequenceDiagram
     participant U as urlintel
     participant S as scans
     participant M as MongoDB
-    participant Q as Queue
-    participant W as Worker
+    participant R as Scan runner<br/>(in-process)
     participant P as Hybrid Analysis
 
     E->>E: local cache hit? → apply local policy, stop
@@ -140,25 +149,26 @@ sequenceDiagram
     else no record
         A->>M: atomic upsert scan record (unique on fingerprint)
         A->>M: encrypt URL into transient_urls (AES-256-GCM, AAD=scan_id)
-        A->>Q: enqueue {scan_id} only — ADR 0013
         A-->>E: 202 {status: queued, status_url}
     end
 
-    W->>Q: claim job (scan_id)
-    W->>M: read + decrypt transient_urls by scan_id
-    W->>P: POST submit url (only plaintext crossing a boundary)
-    P-->>W: provider_scan_id
-    W->>M: DELETE transient_urls — immediately, not on TTL
-    W->>M: status=submitted, provider_scan_id
+    Note over M,R: the scans document is the job —<br/>no second record to enqueue
+
+    R->>M: claim (atomic lease: lease_owner + lease_expires_at)
+    R->>M: read + decrypt transient_urls by scan_id
+    R->>P: POST submit url (only plaintext crossing a boundary)
+    P-->>R: provider_scan_id
+    R->>M: DELETE transient_urls — immediately, not on TTL
+    R->>M: status=submitted, provider_scan_id
     loop backoff until terminal
-        W->>P: GET analysis result
-        P-->>W: report
+        R->>P: GET analysis result
+        P-->>R: report
     end
-    W->>W: normalize → CyberGuard verdict
-    W->>M: persist verdict + expires_at
+    R->>R: normalize → CyberGuard verdict
+    R->>M: persist verdict + expires_at
     alt verdict changes the effective rule set
-        W->>M: bump ruleset version atomically
-        W->>M: write ruleset snapshot
+        R->>M: bump ruleset version atomically
+        R->>M: write ruleset snapshot
     end
     E->>A: GET /api/v1/get-url/{scan_id}
     A->>M: read
@@ -172,6 +182,11 @@ sequenceDiagram
   `transient_urls` record that is deleted the moment submission completes.
 - **Job creation is idempotent per fingerprint.** Concurrent identical
   submissions must produce exactly one provider submission.
+- **A claim is a lease, and the lease outlives the work.** The lease is derived
+  as `WORKER_POLL_DEADLINE + WORKER_POLL_INTERVAL + CLAIM_LEASE_HEADROOM` and
+  validated at config load, so no configuration can let one consumer claim a scan
+  whose provider analysis is still running. A lapsed lease is not a failure: the
+  scan simply becomes claimable again.
 - **Scan status and verdict are independent axes.** A `running` scan has no
   verdict. A `failed` scan has no verdict.
 - **No failure path produces `no_threat_detected`.** Timeout, auth failure,
@@ -184,7 +199,7 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> queued: POST /check-url accepted
-    queued --> running: worker claims job
+    queued --> running: runner claims the scan (lease taken)
     running --> completed: provider returned a terminal report
     running --> failed: permanent error (auth, quota, bad request)
     running --> timed_out: deadline exceeded
@@ -227,7 +242,7 @@ sequenceDiagram
     participant E as Extension
     participant A as API
     participant M as MongoDB
-    participant W as Worker
+    participant R as Scan runner
 
     E->>A: GET /api/v1/get-all?version=7
     A->>M: read current ruleset snapshot
@@ -239,9 +254,9 @@ sequenceDiagram
         A-->>E: 200 {version: 9, generated_at, rules: [...]}
         Note over E,A: ETag = "v9"; extension stores<br/>version and re-applies rules
     end
-    W->>M: verdict becomes eligible for a rule
-    W->>M: atomic $inc version, rebuild snapshot if changed
-    Note over W,M: version increments only when the<br/>effective rule set actually changes
+    R->>M: verdict becomes eligible for a rule
+    R->>M: atomic $inc version, rebuild snapshot if changed
+    Note over R,M: version increments only when the<br/>effective rule set actually changes
 ```
 
 Eligibility is policy, not provider output. A verdict may be recorded without
@@ -250,10 +265,9 @@ producing a rule. See
 
 ## 6. Dependency failure behaviour
 
-| Failure | API behaviour | Worker behaviour | Extension sees |
+| Failure | API behaviour | Scan runner behaviour | Extension sees |
 |---|---|---|---|
-| MongoDB down | `/health/ready` → 503; API endpoints → 503 `service_unavailable` | cannot read assessments or transient URLs; leases lapse, jobs requeue | `could not determine`, never "safe" |
-| Redis down | Readiness degraded. Cached reads still served. New submissions → `503` + `Retry-After` — **fail closed** | cannot claim jobs; in-flight claims complete | queued, no result |
+| MongoDB down | `/health/ready` → 503; API endpoints → 503 `service_unavailable` | cannot read assessments or transient URLs; leases lapse, so scans requeue once it returns | `could not determine`, never "safe" |
 | Hybrid Analysis down | Readiness reports provider `degraded`, not a global 503 | retries with backoff, then `failed` | `could not determine` |
 | API key missing/invalid | `check-url` → 503 `not_ready`; cached reads still work | refuses to submit | service unavailable |
 | HMAC key missing | `/health/ready` → 503; `check-url` → 503 | no fingerprinting possible | service unavailable |
@@ -261,14 +275,27 @@ producing a rule. See
 | Rate limit exceeded | `429` + `Retry-After` | n/a | back off and retry |
 | Quota exhausted | `503` + `Retry-After` — fail closed, never exceed the provider contract | drains queue, no new submissions | `could not determine` |
 
-Redis down is the case most likely to be under-designed. Because the API is
-unauthenticated ([ADR 0014](decisions/0014-abuse-protection-without-authentication.md)),
-the rate-limit and quota counters live in Redis. If it is unreachable, those
-controls cannot be evaluated, so submissions must stop rather than proceed
-unguarded.
+MongoDB down is now the single-datastore case. It is both the source of truth
+and the queue, so one outage takes submission and analysis together rather than
+leaving work stranded in a broker nobody is reading. The lease is what makes
+that recoverable: a claim held by a process that died during the outage simply
+expires, and the scan is claimable again.
 
-Liveness never depends on MongoDB, Redis or the provider: a dependency outage
-must not cause an orchestrator to restart every replica.
+The rate-limit and quota counters are **in-process**, which trades a shared
+guarantee for one fewer thing that can fail while load-bearing. Stated plainly,
+because it is not a small cost:
+
+- Counters are per-process, so N replicas allow N times the configured rate.
+- Counters reset on restart, so a crash is a free reset for every subject.
+
+Neither is acceptable against a hard financial limit. If this ever scales out,
+the counters move back to a shared store and `internal/ratelimit`'s interface
+does not change — substitution is local to that package. Within a single
+process the arithmetic, the `X-RateLimit-*` headers and the fail-closed
+contract are exactly what they were.
+
+Liveness never depends on MongoDB or the provider: a dependency outage must not
+cause an orchestrator to restart every replica.
 
 ## 7. Conflicts found during review
 
@@ -284,7 +311,7 @@ that closed it.
 | 5 | Repository layout | `CYBERGUARD_PROJECT.md` §4 (`apps/backend`, `apps/extension`) vs prompt §10 | Prompt's `cmd/` + `internal/` adopted. See [`module-map.md`](module-map.md) |
 | 6 | Router | Prompt §2 "Chi router, if justified" vs prompt §2 "Go / net/http" | Standard library `http.ServeMux`, handlers handwritten. OpenAPI adopted as contract with a CI drift check instead of code generation. [ADR 0005](decisions/0005-standard-library-http.md) as amended by [ADR 0015](decisions/0015-openapi-and-rfc-9457.md) |
 | 7 | MongoDB driver reference | `CYBERGUARD_PROJECT.md` §18 cites the **PHP** Laravel MongoDB driver | Obsolete. The official Go driver (`go.mongodb.org/mongo-driver/v2`) is used |
-| 8 | Redis required vs optional | `CYBERGUARD_PROJECT.md` §13 vs prompt §2/§11 "only if required" | **Redis is required.** It is the job queue and the rate-limit/quota backend. [ADR 0017](decisions/0017-redis-in-the-mvp.md), reversing the [ADR 0003](decisions/0003-asynchronous-analysis-jobs.md) recommendation |
+| 8 | Redis required vs optional | `CYBERGUARD_PROJECT.md` §13 vs prompt §2/§11 "only if required" | **Resolved by reversal.** Redis was made required by [ADR 0017](decisions/0017-redis-in-the-mvp.md), then removed: the scans collection is the queue and the rate-limit counters are in-process ([ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md)). MongoDB is the only datastore |
 | 9 | Health endpoint names | `CYBERGUARD_PROJECT.md` §5.7 (`/health/live`, `/health/ready`) vs Go convention (`/healthz`, `/readyz`) | Documented contract wins; already implemented that way |
 | 10 | MongoDB major version | Compose pins `mongo:9.0`; docs say "MongoDB" generically | MongoDB 8.x cannot start on kernel ≥ 6.19 (SERVER-121912). Documented in [`docker-development.md`](docker-development.md) |
 
@@ -293,7 +320,7 @@ review, and are listed here so the record is complete:
 
 | # | Conflict | Resolution |
 |---|---|---|
-| 11 | Durable queue vs "never retain raw URLs" | Queue payloads carry scan IDs only; raw URLs encrypted in a short-lived collection and deleted immediately. [ADR 0013](decisions/0013-durable-jobs-and-url-privacy.md) |
+| 11 | Durable queue vs "never retain raw URLs" | Work is carried by the scan document itself, which carries a scan ID and no URL field; raw URLs encrypted in a short-lived collection and deleted immediately. [ADR 0013](decisions/0013-durable-jobs-and-url-privacy.md) as amended by [ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md) |
 | 12 | Unauthenticated API vs abuse exposure | Rate limits, quotas, request limits and concurrency controls are mandatory. [ADR 0014](decisions/0014-abuse-protection-without-authentication.md) |
 
 ## 8. Current implementation status
@@ -307,18 +334,22 @@ preserved, not discarded.
 | `internal/logging` | Implemented (`log/slog` JSON) |
 | `internal/urlintel` | Implemented and tested — validation, canonicalisation, HMAC fingerprints, PSL host intelligence |
 | `internal/httpapi` | Implemented — routes, middleware, RFC 9457 errors, abuse controls |
-| `internal/scans` | Implemented — lifecycle, dispatch, worker loop, reconciler, target gate |
-| `internal/ratelimit` | Implemented — Redis fixed-window counters, fail closed |
+| `internal/scans` | Implemented — lifecycle, dispatch, in-process consumer loop, reconciler, target gate |
+| `internal/ratelimit` | Implemented — in-process fixed-window counters, fail closed |
 | `internal/memstore` | Implemented — in-memory Store/Queue for tests |
-| `cmd/api`, `cmd/worker` | Implemented — graceful shutdown; worker consumes the queue |
+| `cmd/api`, `cmd/migrate` | Implemented — graceful shutdown; the API runs the scan pipeline as goroutines. There is no `cmd/worker` |
 | MongoDB persistence | Implemented — `scans` / `assessments` / `transient_urls`, indexes, migrations |
-| Redis queue / rate limits | Implemented — `RPUSH`/`BLPOP` scan queue, fixed-window counters |
+| Queue | Implemented — the `scans` collection, claimed by atomic lease (`by_claimable`); no broker |
 | Transient URL encryption | Implemented — AES-256-GCM, scan ID as AAD |
 | Provider adapter | Implemented and tested against a mock; **never against the live API** |
 | Rulesets | Implemented — eligibility policy, DNR generation with full-snapshot validation, versioned immutable snapshots, ETag/conditional responses |
 | Metrics / tracing | **Absent** (logs only) |
 | OpenAPI document | Implemented — OpenAPI 3.1, drift-checked against the router |
 | RFC 9457 error bodies | Implemented |
+
+The topology this produces is one application process plus one datastore. That
+is the point of [ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md),
+and the costs it accepts are recorded there and in §6 rather than glossed over.
 
 Deliberate omissions, with reasons:
 
@@ -377,15 +408,18 @@ in [`decisions/README.md`](decisions/README.md).
 | [0014](decisions/0014-abuse-protection-without-authentication.md) | No auth in v1; four mandatory controls | Closes conflict #12; drives the failure table |
 | [0015](decisions/0015-openapi-and-rfc-9457.md) | OpenAPI contract, RFC 9457 errors | Amends ADR 0005; absorbs ADR 0006 |
 | [0016](decisions/0016-go-module-path.md) | Module path from the Git remote | Must happen before Phase 3 |
-| [0017](decisions/0017-redis-in-the-mvp.md) | Redis is required | Reverses ADR 0003; closes conflict #8 |
+| [0017](decisions/0017-redis-in-the-mvp.md) | Redis is required | **Superseded** by ADR 0019; closes conflict #8 |
+| [0018](decisions/0018-ruleset-thresholds-and-scope.md) | Ruleset thresholds and scope | Bounds how broad a published rule may be |
+| [0019](decisions/0019-mongodb-queue-and-in-process-runner.md) | The scans collection is the queue; the API runs the pipeline | Reverses ADR 0017; drives §2, §6 and §8 |
 
-Two launch blockers remain, both recorded as ADRs because each changes what the
+One launch blocker remains, recorded as an ADR because it changes what the
 system may do rather than merely what it builds:
 
 1. **Hybrid Analysis usage approval** — [ADR 0010](decisions/0010-hybrid-analysis-licensing.md).
-2. **`maxmemory-policy noeviction` on Redis** — [ADR 0017](decisions/0017-redis-in-the-mvp.md).
-   Under an eviction policy the queue can be silently dropped under memory
-   pressure, which is indistinguishable from a lost job.
+
+The Redis blocker that stood here — `maxmemory-policy noeviction`, so that an
+eviction policy could not silently drop queued jobs — is gone with Redis. There
+is no in-memory queue left to evict.
 
 The fifteen provider-specific technical questions remain open and cannot be
 closed by any decision; see

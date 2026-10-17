@@ -1,15 +1,17 @@
 # CyberGuard AI — local development topology.
 #
 # Mirrors section 13 of docs/Architecture/CYBERGUARD_PROJECT.md:
-#   backend  Go HTTP API (published on :8080)
-#   worker   same image, queue/provider work
-#   mongodb  authoritative store (internal only)
-#   redis    queue/cache backend (internal only)
+#   backend  Go HTTP API (published on :8080) — also runs the scan pipeline
+#   mongodb  authoritative store and work queue (internal only)
 #
-# MongoDB and Redis deliberately publish no host ports, per section 11.11.
+# The worker service and the Redis service are gone. Job delivery moved into the
+# API as goroutines and the scans collection became the queue, so MongoDB is the
+# only datastore. See docs/decisions/0013-durable-jobs-and-url-privacy.md.
+#
+# MongoDB deliberately publishes no host ports, per section 11.11.
 #
 #   docker compose up -d --build      start everything
-#   docker compose logs -f backend     follow API logs
+#   docker compose logs -f backend     follow API and scan logs
 #   docker compose down                stop
 #   docker compose down -v             stop and delete all data
 
@@ -33,19 +35,41 @@ x-app-image: &app-image
     LOG_FORMAT: ${LOG_FORMAT:-json}
     MONGODB_URI: mongodb://mongodb:27017
     MONGODB_DATABASE: ${MONGODB_DATABASE:-cyberguard}
-    REDIS_ADDR: redis:6379
-    # Selects the analysis backend. "mock" keeps every URL inside the worker
-    # process and needs no API key; "hybrid-analysis" uses the real service.
+    # Selects the analysis backend. "mock" analyses URLs in-process and needs no
+    # API key; "hybrid-analysis" uses the real service.
+    #
+    # There is no fallback in either direction. This default only applies when
+    # .env omits the setting entirely.
     ANALYSIS_PROVIDER: ${ANALYSIS_PROVIDER:-mock}
-    # No "www": that is what the v2 specification declares. A wrong base URL
-    # fails as a connection error rather than as an authentication error, which
-    # is a confusing way to learn a typo.
+    # No "www": that is what the v2 specification declares, and that host
+    # answers 301. A wrong base URL fails as a connection error rather than as an
+    # authentication error, which is a confusing way to learn a typo.
     HYBRID_ANALYSIS_BASE_URL: ${HYBRID_ANALYSIS_BASE_URL:-https://hybrid-analysis.com/api/v2}
     HYBRID_ANALYSIS_API_KEY: ${HYBRID_ANALYSIS_API_KEY:-}
+    # Sandbox for URL analysis. 140 is Windows 11 64 bit, chosen because
+    # phishing kits target Windows browsers. Listed here rather than left
+    # implicit, so the effective provider settings are readable from this file.
+    HYBRID_ANALYSIS_ENVIRONMENT_ID: ${HYBRID_ANALYSIS_ENVIRONMENT_ID:-140}
+    HYBRID_ANALYSIS_TIMEOUT: ${HYBRID_ANALYSIS_TIMEOUT:-30s}
+    HYBRID_ANALYSIS_MAX_RETRIES: ${HYBRID_ANALYSIS_MAX_RETRIES:-3}
+    HYBRID_ANALYSIS_RETRY_BASE: ${HYBRID_ANALYSIS_RETRY_BASE:-500ms}
     URL_FINGERPRINT_HMAC_KEY: ${URL_FINGERPRINT_HMAC_KEY:-}
     # Required. Without it the API refuses submissions and readiness fails,
     # rather than storing raw URLs in the clear.
     URL_ENCRYPTION_KEY: ${URL_ENCRYPTION_KEY:-}
+    # Claim pacing and lease sizing for the in-process scan runner.
+    #
+    # The lease must outlive the longest possible unit of work — a provider poll
+    # bounded by WORKER_POLL_DEADLINE — or a second consumer could claim a scan
+    # whose analysis is still running, and on the submission path that means
+    # submitting the URL twice. The lease is derived from the poll deadline plus
+    # CLAIM_LEASE_HEADROOM and validated at startup, so it is stated here for
+    # visibility rather than configured directly.
+    WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-5s}
+    WORKER_POLL_DEADLINE: ${WORKER_POLL_DEADLINE:-5m}
+    WORKER_CLAIM_POLL_GAP: ${WORKER_CLAIM_POLL_GAP:-250ms}
+    CLAIM_LEASE_HEADROOM: ${CLAIM_LEASE_HEADROOM:-30s}
+    WORKER_STALL_THRESHOLD: ${WORKER_STALL_THRESHOLD:-2m}
     # Protection ruleset generation. Defaults mirror .env.example; see ADR 0018
     # for why the thresholds are provisional.
     RULESET_ENABLED: ${RULESET_ENABLED:-true}
@@ -55,6 +79,14 @@ x-app-image: &app-image
     RULESET_MIN_CORROBORATION_DOMAIN: ${RULESET_MIN_CORROBORATION_DOMAIN:-5}
     RULESET_MAX_RULES: ${RULESET_MAX_RULES:-5000}
     RULESET_REBUILD_INTERVAL: ${RULESET_REBUILD_INTERVAL:-60s}
+    # DNR shape. Action is block (default) or redirect; a redirect needs the
+    # client to declare the page in web_accessible_resources. The regex cap is
+    # Chrome's own limit and must not be raised.
+    RULESET_ACTION: ${RULESET_ACTION:-block}
+    RULESET_REDIRECT_PATH: ${RULESET_REDIRECT_PATH:-/locked.html}
+    RULESET_RESOURCE_PROFILE: ${RULESET_RESOURCE_PROFILE:-navigation_and_active}
+    RULESET_PRIORITY: ${RULESET_PRIORITY:-1}
+    RULESET_MAX_REGEX_RULES: ${RULESET_MAX_REGEX_RULES:-1000}
     # Serves Swagger UI at /docs/ and the contract at /openapi.yaml. Set to
     # false if the contract should not be browsable; the API is unaffected
     # either way, and no credential is involved.
@@ -64,8 +96,6 @@ x-app-image: &app-image
   depends_on:
     migrate:
       condition: service_completed_successfully
-    redis:
-      condition: service_healthy
   restart: unless-stopped
 
 services:
@@ -103,17 +133,6 @@ services:
     container_name: cyberguard-backend
     ports:
       - "8080:8080"
-
-  worker:
-    <<: *app-image
-    container_name: cyberguard-worker
-    # Same image, different entrypoint: the worker owns slow provider work.
-    entrypoint: ["/usr/local/bin/cyberguard-worker"]
-    # The image HEALTHCHECK probes the API's HTTP listener, which the worker
-    # does not run, so it would report permanently unhealthy. Disable it here
-    # until the worker exposes its own liveness signal.
-    healthcheck:
-      disable: true
 
   # Interactive Go toolchain for building and testing on the host side.
   #   docker compose run --rm go test ./...
@@ -169,33 +188,5 @@ services:
       start_period: 20s
     restart: unless-stopped
 
-  redis:
-    image: redis:8-alpine
-    container_name: cyberguard-redis
-    # Append-only persistence so queued jobs survive a restart.
-    #
-    # maxmemory-policy noeviction is a launch blocker, not a tuning knob
-    # (ADR 0017). Under an eviction policy Redis silently drops queued scan
-    # jobs under memory pressure, which is indistinguishable from a lost job:
-    # nothing errors, the scan just never runs. Failing the write instead
-    # surfaces the problem, and the reconciler retries.
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --maxmemory-policy
-      - noeviction
-    volumes:
-      - redis-data:/data
-    # No published ports: reachable as "redis:6379" inside the network only.
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-    restart: unless-stopped
-
 volumes:
   mongo-data:
-  redis-data:

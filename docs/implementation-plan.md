@@ -9,12 +9,12 @@
 | Phase | Status |
 |---|---|
 | 1. Architecture and documentation | ✅ Complete |
-| 2. Go foundation, config, logging, health | ✅ **Complete** — module, config, slog, HTTP server, graceful shutdown, liveness/readiness, MongoDB + Redis connectivity, Docker Compose, OpenAPI, unit and integration tests, mock provider |
+| 2. Go foundation, config, logging, health | ✅ **Complete** — module, config, slog, HTTP server, graceful shutdown, liveness/readiness, MongoDB connectivity, Docker Compose, OpenAPI, unit and integration tests, mock provider |
 | 3. MongoDB, URL intelligence, indexed lookup | ✅ **Complete** — `scans` / `assessments` / `transient_urls` repositories, indexes including the partial unique dedup index, verdict cache with expiry, AES-256-GCM transient URLs, and the `urlintel` rename with the Public Suffix List |
-| 4. Scan lifecycle, async jobs, dedup | ✅ **Complete** — `internal/scans`: submit → dedup → dispatch → submit to provider → poll → normalise → cache → serve; Redis queue, reconciler, worker loop, SSRF gate |
+| 4. Scan lifecycle, async jobs, dedup | ✅ **Complete** — `internal/scans`: submit → dedup → claim → submit to provider → poll → normalise → cache → serve; the `scans` collection as the work queue with lease-based claiming, reconciler, in-process scan runner, SSRF gate |
 | 5. Hybrid Analysis integration | ✅ **Complete** — contract verified against the official OpenAPI document; adapter, verdict normalisation and tests in place. Nine specification gaps remain open ([V1–V9](hybrid-analysis-integration.md#10-open-questions-requiring-manual-verification)) |
-| 6. Verdict normalisation, result retrieval | ✅ **Complete** — normalisation, persistence and status retrieval all land with the worker in Phase 4 |
-| 7. Abuse controls (ADR 0014) | ✅ **Complete** — Redis fixed-window per-client and per-fingerprint limits, fail closed, `X-RateLimit-*` headers |
+| 6. Verdict normalisation, result retrieval | ✅ **Complete** — normalisation, persistence and status retrieval all land with the scan runner in Phase 4 |
+| 7. Abuse controls (ADR 0014) | ✅ **Complete** — in-process fixed-window per-client and per-fingerprint limits, fail closed, `X-RateLimit-*` headers |
 | 8. Versioned rulesets, extension API | ✅ **Complete** — `internal/rulesets` policy + DNR generation + validation, versioned snapshots, ETag/304, `unchanged` and `X-Ruleset-Rolled-Back` |
 | 9. Chrome extension | ⬜ Not started — out of scope for the backend |
 | 10. Hardening, CI, deployment | ⬜ Not started — no CI pipeline yet; every check is run by hand |
@@ -25,13 +25,15 @@ implemented; no client-side code of any kind was written.
 
 ## 1a. Phase 4 — End-to-end scan workflow ✅
 
-**Delivered.** `internal/scans` (lifecycle, worker, target gate), `internal/ratelimit`,
-Redis queue operations, `internal/memstore` test doubles, `internal/app` wiring,
-and both entry points driving the real pipeline.
+**Delivered.** `internal/scans` (lifecycle, runner, target gate),
+`internal/ratelimit`, `internal/platform/mongoqueue` (claim leases over the
+`scans` collection), `internal/memstore` test doubles, `internal/app` wiring,
+and a single entry point — `cmd/api` — serving the API and running the pipeline.
 
 **Verified.** `gofmt`, `go vet`, `go build`, `go test`, `go test -race`, unit
-tests, and integration tests against live MongoDB 9 and Redis 8 — including a
-full submit → analyse → verdict cycle with the mock provider.
+tests, and integration tests against live MongoDB 9 — including a full submit →
+analyse → verdict cycle with the mock provider. Redis is no longer a test
+dependency; see [ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md).
 
 ### The workflow, as implemented
 
@@ -43,11 +45,12 @@ POST /api/v1/check-url
   → per-fingerprint budget check            ← charged only on a real submission
   → PutTransientURL                         ← AES-256-GCM, scan ID as AAD
   → CreateScan                              ← partial unique index deduplicates
-  → Enqueue                                 ← scan ID only
-  → 202 {scan_id, status_url}
+  → 202 {scan_id, status_url}                ← the scan document is the work;
+                                              it is already claimable
 
-worker
-  → BLPOP scan id → GetScan (terminal? → drop)
+scan runner (goroutines inside cmd/api)
+  → ClaimNextScan: one atomic FindOneAndUpdate ← stamps lease_owner + expiry
+  → GetScan (terminal? → release the lease)
   → TakeTransientURL                        ← read and delete in one operation
   → SubmitURL → RecordProviderSubmission    ← persisted immediately
   → poll with backoff → RecordProviderState
@@ -57,6 +60,13 @@ worker
 GET /api/v1/get-url/{scanId}
   → ScanResult; verdict present only when completed and still fresh
 ```
+
+The second block is not a separate process. It is goroutines in the same binary
+as the listener, which is why the `202` above is returned before any of it
+happens: no HTTP request is ever waiting on an analysis, and a detonation that
+takes minutes changes nothing about how long a connection is held open. The
+decoupling that mattered was between the *request* and the *analysis*, not
+between two processes.
 
 ### Three decisions worth recording
 
@@ -77,17 +87,28 @@ and suppress re-checking for hours. A verdict is only cached for an analysis tha
 actually completed and did not fail — which is what keeps `no_threat_detected`
 reachable only through a recognised classification on a successful analysis.
 
-### Verified against live Redis, not assumed
+### The claim was verified against a real MongoDB, not assumed
 
-Three queue bugs were found by integration tests and would not have been caught
-by unit tests:
+Two properties of the claim are properties of the server, and only a real server
+proves them:
 
-- `BRPOP` pops from the tail, so the queue was **LIFO**. `RPUSH` + `BLPOP` is the
-  FIFO pairing.
-- A sub-second block rounded to `"0"`, which Redis reads as **block forever**.
-- go-redis applies a context *deadline* to a socket read but does not act on
-  plain cancellation, so a blocked worker ignored `SIGTERM`. `Claim` now derives
-  its own deadline from the block.
+- **`FindOneAndUpdate` is atomic per document**, so two claimants can never
+  receive the same scan. `TestClaimIsExclusive` races twelve of them against a
+  live `mongod` and asserts one winner. A double would have merely restated the
+  assumption.
+- **An absent field does not satisfy a date comparison.** `{"available_at":
+  {"$lte": now}}` does not match a document where `available_at` is missing, so
+  the filter carries an explicit `$exists` branch. Without it every scan written
+  before the lease fields existed would have been stranded for ever, and no
+  error would have been raised —
+  `TestScansWithoutLeaseFieldsAreStillClaimable` is the test that catches it.
+
+Three queue bugs were found the same way when delivery lived in Redis — a LIFO
+`BRPOP`, a sub-second block rounding to block-forever, and a driver that honoured
+a deadline but not a cancellation. None were in our logic; all were in how the
+broker's primitives behave under conditions a unit test would have modelled from
+assumption. The Redis code and its tests are gone; the lesson is the reason
+these two tests exist in this shape.
 
 ## 2. Phase 1 — Architecture and documentation ✅
 
@@ -117,7 +138,7 @@ unverifiable. Phase 5 is therefore gated, not merely sequenced.
 **Scope.** Module, configuration, logging, health endpoints, HTTP skeleton,
 Docker.
 
-**Delivered.** `cmd/api`, `cmd/worker`, `internal/{config,logging,httpapi,
+**Delivered.** `cmd/api`, `cmd/migrate`, `internal/{config,logging,httpapi,
 urlintel}`, multi-stage Dockerfile, Compose topology. Verified: build, vet,
 gofmt, tests, live HTTP smoke test.
 
@@ -176,35 +197,45 @@ real MongoDB. Unit-test the BSON mapping separately.
 
 ## 5. Phase 4 — Scan lifecycle and jobs
 
-**Scope.** The state machine, the queue, and the deduplication guarantee.
+**Scope.** The state machine, the work queue, and the deduplication guarantee.
 
 **Deliverables.**
 
 - `internal/scans` — lifecycle, transitions, retry policy.
-- `internal/platform/queue` — MongoDB-backed job queue with atomic claim and
-  lease expiry.
-- Worker loop: claim → submit → poll → normalise → persist → maybe bump ruleset.
-- Indexes from `data-model.md` §3.
+- `internal/platform/mongoqueue` — the `scans` collection behind the delivery
+  interface: atomic claim, time-bounded lease, lease expiry, retry deferral.
+- In-process scan runner: claim → submit → poll → normalise → persist → maybe
+  bump ruleset. Started by `cmd/api` on its own goroutines.
+- Indexes from `data-model.md` §2, including `by_claimable`.
 
 **Dependencies.** Phase 3.
 
 **Acceptance criteria.**
 
-- [ ] N concurrent identical requests produce **exactly one** job and one
-      shared `scan_id`.
-- [ ] A `kill -9`'d worker's job is recovered after its lease lapses.
+- [ ] N concurrent identical requests produce **exactly one** claimable scan and
+      one shared `scan_id`.
+- [ ] A `kill -9`'d consumer's scan is recovered once its lease lapses, with no
+      sweeper and nothing running to notice.
 - [ ] Retries are bounded, jittered, and stop at `max_attempts`.
 - [ ] Illegal state transitions are rejected.
 - [ ] No goroutine leaks (`goleak`).
+- [ ] The lease is derived from the poll deadline and validated, not configured.
 
 **Tests.** Layer 3 with fakes, plus a concurrency test under `-race`; Layer 4
-for the claim query.
+for the claim query, against a real MongoDB — see
+[`testing-strategy.md` §6](testing-strategy.md#6-layer-4--mongodb-integration).
 
 **Risks.**
 
 - *Duplicate provider submissions from a TOCTOU race.* Mitigation: atomic
-  `findOneAndUpdate`, never check-then-insert. This is the central risk of the
-  phase and deserves the most test attention.
+  `findOneAndUpdate`, never check-then-insert, and a lease that provably
+  outlives the longest unit of work. This is the central risk of the phase and
+  deserves the most test attention.
+- *A lease shorter than the work it covers.* This would let a second consumer
+  start on a scan whose analysis is still running, and on the submission path
+  that is a second submission of the same URL. Mitigation: the lease is derived
+  from `WORKER_POLL_DEADLINE` and a non-positive headroom is a config error, so
+  no setting produces it.
 - *Submitting a URL without the URL being durable.* See open question 4.
 
 ## 6. Phase 5 — Hybrid Analysis integration ⛔ BLOCKED
@@ -295,8 +326,9 @@ MongoDB for version atomicity.
 **Deliverables.**
 
 - Rate limiting per the contract.
-- Metrics: cache hit rate, queue age, provider latency, failure and timeout
-  counts, polling volume — **without request-derived labels**.
+- Metrics: cache hit rate, time from scan creation to first claim, provider
+  latency, failure and timeout counts, polling volume — **without
+  request-derived labels**.
 - OpenTelemetry tracing with request-ID correlation.
 - CI: `go vet`, `staticcheck`, `go test -race -coverpkg=./...`, `govulncheck`,
   coverage floor.
@@ -349,7 +381,7 @@ Every question raised by the architecture review is closed by a decision record.
 | 5 | How is an unauthenticated endpoint protected? | Rate limits, quotas, request limits and concurrency controls are mandatory. [ADR 0014](decisions/0014-abuse-protection-without-authentication.md) |
 | 6 | Adopt OpenAPI and RFC 9457? | Both adopted; must land before the extension ships. [ADR 0015](decisions/0015-openapi-and-rfc-9457.md) |
 | 7 | What is the real module path? | Derived from the Git remote. **Currently a placeholder — see D1.** [ADR 0016](decisions/0016-go-module-path.md) |
-| 8 | Keep Redis in the MVP? | Yes — it is the queue and the rate-limit counter store. [ADR 0017](decisions/0017-redis-in-the-mvp.md) |
+| 8 | Keep Redis in the MVP? | **No — reversed.** It was the queue and the rate-limit counter store; both moved in-process, and Redis is gone. [ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md) supersedes [ADR 0017](decisions/0017-redis-in-the-mvp.md) |
 
 ### Outstanding deviations
 
@@ -368,10 +400,13 @@ tasks, because each changes what the system may do:
 
 1. **[ADR 0010](decisions/0010-hybrid-analysis-licensing.md)** — written
    approval for Hybrid Analysis usage.
-2. **[ADR 0017](decisions/0017-redis-in-the-mvp.md)** —
-   `maxmemory-policy noeviction`. Enforced today by
-   `TestRedisDoesNotEvict` in the integration suite; it passes, but nothing yet
-   prevents a deploy from changing it.
+2. **[ADR 0019](decisions/0019-mongodb-queue-and-in-process-runner.md)** — the
+   rate-limit counters are per-process, so **the configured limits are per
+   replica**. A single-replica deployment is fine; three replicas allow three
+   times the configured submission rate against a provider quota that is billed.
+   Scaling out horizontally requires moving the counters to a shared store
+   behind the unchanged `ratelimit.Limiter` interface before the second replica
+   exists, not after.
 
 ### Still unverified
 

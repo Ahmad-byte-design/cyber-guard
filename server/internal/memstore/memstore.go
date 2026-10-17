@@ -20,8 +20,9 @@
 //
 // Every dependency the workflow depends on can be made to fail on demand:
 // MongoDB reads and writes, the enqueue, the verdict write. That is the only
-// way to test "MongoDB succeeded but Redis enqueue failed", which is the case
-// the reconciler exists to repair and which cannot be produced any other way.
+// way to test "the scan was recorded but the job never arrived", which is the
+// case the reconciler exists to repair and which cannot be produced any other
+// way.
 package memstore
 
 import (
@@ -38,7 +39,7 @@ import (
 	"time"
 
 	"cyberguard/server/internal/platform/mongostore"
-	"cyberguard/server/internal/platform/redisqueue"
+	"cyberguard/server/internal/scans"
 	"cyberguard/server/internal/verdicts"
 )
 
@@ -143,6 +144,36 @@ func (s *Store) GetScan(ctx context.Context, scanID string) (mongostore.Scan, er
 		return mongostore.Scan{}, mongostore.ErrScanNotFound
 	}
 	return scan, nil
+}
+
+// FindLatestScanByFingerprint returns the newest scan for a fingerprint.
+//
+// It mirrors the MongoDB implementation, which sorts by created_at descending
+// and takes the first hit. Map iteration order here is random, so the tie-break
+// is done explicitly — otherwise a test could pass or fail depending on Go's
+// map seed, which is exactly the kind of flakiness a fake must not introduce.
+func (s *Store) FindLatestScanByFingerprint(ctx context.Context, fingerprint string) (mongostore.Scan, error) {
+	if err := s.check("read"); err != nil {
+		return mongostore.Scan{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var newest mongostore.Scan
+	var found bool
+
+	for _, scan := range s.scans {
+		if scan.URLFingerprint != fingerprint {
+			continue
+		}
+		if !found || scan.CreatedAt.After(newest.CreatedAt) {
+			newest, found = scan, true
+		}
+	}
+	if !found {
+		return mongostore.Scan{}, mongostore.ErrScanNotFound
+	}
+	return newest, nil
 }
 
 func (s *Store) FindActiveScanByFingerprint(ctx context.Context, fingerprint string) (mongostore.Scan, error) {
@@ -528,7 +559,14 @@ func (s *Store) check(kind string) error {
 
 // ------------------------------------------------------------------ queue
 
-// Queue is an in-memory redisqueue.Client substitute.
+// Queue is an in-memory scans.Queue substitute.
+//
+// It deliberately keeps the *old* explicit-queue semantics — enqueue appends,
+// claim pops — rather than mimicking the MongoDB lease. That is intentional: the
+// reconciler's job is to notice work that is durable but undelivered, and a
+// double that models the real queue's behaviour would make those tests
+// vacuous. The real lease semantics are exercised in mongostore's integration
+// tests, where they belong.
 type Queue struct {
 	mu     sync.Mutex
 	queue  []string
@@ -542,6 +580,9 @@ type Queue struct {
 	// Claimed records the scan IDs Claim has handed out, including repeats, so a
 	// test can assert duplicate delivery.
 	Claimed []string
+
+	// Released records the scan IDs Release returned early.
+	Released []string
 }
 
 // NewQueue builds an empty in-memory queue.
@@ -568,17 +609,27 @@ func (q *Queue) EnqueueRetry(ctx context.Context, scanID string, delay time.Dura
 
 // Claim pops one job. A block timeout is honoured only up to a small bound so
 // tests stay fast; a non-blocking pop is enough to drain the queue.
-func (q *Queue) Claim(ctx context.Context, block time.Duration) (redisqueue.Job, error) {
+func (q *Queue) Claim(ctx context.Context, block time.Duration) (scans.Job, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
 	if len(q.queue) == 0 {
-		return redisqueue.Job{}, redisqueue.ErrNoJob
+		return scans.Job{}, scans.ErrNoJob
 	}
 	scanID := q.queue[0]
 	q.queue = q.queue[1:]
 	q.Claimed = append(q.Claimed, scanID)
-	return redisqueue.Job{ScanID: scanID}, nil
+	return scans.Job{ScanID: scanID}, nil
+}
+
+// Release is a no-op for an explicit queue, since claiming already removed the
+// job. It records the call so a test can assert leases are handed back promptly
+// rather than left to expire.
+func (q *Queue) Release(_ context.Context, scanID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	q.Released = append(q.Released, scanID)
+	return nil
 }
 
 func (q *Queue) PromoteDue(ctx context.Context, limit int) (int, error) {
@@ -636,7 +687,7 @@ func (s *Store) Verdicts() map[string]verdicts.Verdict {
 //
 // clear=true blanks both fields, matching the production behaviour where the
 // detail is removed once the verdict is known.
-func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, pathPrefix string, clear bool) error {
+func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, port, pathPrefix string, clear bool) error {
 	if err := s.check("write"); err != nil {
 		return err
 	}
@@ -649,9 +700,11 @@ func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, pathPrefix
 	}
 	if clear {
 		scan.Scheme = ""
+		scan.Port = ""
 		scan.PathPrefix = ""
 	} else {
 		scan.Scheme = scheme
+		scan.Port = port
 		scan.PathPrefix = pathPrefix
 	}
 	scan.UpdatedAt = time.Now().UTC()
@@ -659,13 +712,23 @@ func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, pathPrefix
 	return nil
 }
 
-// TargetOf returns a scan's stored scheme and path.
-func (s *Store) TargetOf(scanID string) (scheme, path string, ok bool) {
+// TargetOf returns a scan's stored scheme, port and path.
+func (s *Store) TargetOf(scanID string) (scheme, port, path string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	scan, found := s.scans[scanID]
 	if !found {
-		return "", "", false
+		return "", "", "", false
 	}
-	return scan.Scheme, scan.PathPrefix, true
+	return scan.Scheme, scan.Port, scan.PathPrefix, true
+}
+
+// ScanCount returns how many scans are stored.
+//
+// It exists so a test can assert that a read path did not write anything, which
+// is otherwise only observable by counting documents in the real store.
+func (s *Store) ScanCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.scans)
 }

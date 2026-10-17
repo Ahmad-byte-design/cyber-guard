@@ -33,7 +33,7 @@ import (
 type Dependencies struct {
 	Config config.Config
 	Logger *slog.Logger
-	// Health probes MongoDB and Redis for the readiness endpoint. Optional:
+	// Health probes MongoDB for the readiness endpoint. Optional:
 	// when nil, readiness evaluates configuration only.
 	Health *health.Checker
 	// Scans is the scan lifecycle. Optional: when nil the submission endpoints
@@ -110,6 +110,9 @@ var routeTable = []route{
 
 	{method: "POST", pattern: "/api/v1/check-url", handler: (*Server).handleCheckURL},
 	{method: "GET", pattern: "/api/v1/get-url/{scanId}", handler: (*Server).handleGetURL},
+	// The same lookup expressed by URL. A POST body, not a path parameter:
+	// a URL in a path is a URL in every access log between here and the client.
+	{method: "POST", pattern: "/api/v1/get-url", handler: (*Server).handleGetURLByURL},
 	{method: "GET", pattern: "/api/v1/get-all", handler: (*Server).handleGetAll},
 
 	// Documentation. Gated on API_DOCS_ENABLED, but documented unconditionally:
@@ -164,7 +167,7 @@ func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 // handleReady reports whether the process can do useful work.
 //
 // Configuration checks are pure and always evaluated. Dependency checks —
-// MongoDB and Redis — are delegated to the injected health.Checker and skipped
+// MongoDB — is delegated to the injected health.Checker and skipped
 // entirely when none is supplied, which is the case in unit tests and in the
 // pre-integration skeleton.
 //

@@ -1,10 +1,21 @@
 # 0017 — Redis is part of the MVP
 
-- **Status:** Accepted
+- **Status:** **Superseded** by
+  [ADR 0019](0019-mongodb-queue-and-in-process-runner.md)
 - **Date:** 2026-10-16
 - **Reverses:** the "defer Redis" recommendation in
   [ADR 0003](0003-asynchronous-analysis-jobs.md)
 - **Affects:** `docker-compose.yml`, `architecture.md`, `data-model.md`
+
+> **Superseded 2026-10-17.** Redis has been removed. Its job queue became a
+> time-bounded lease on the scans collection, and its rate-limit counters became
+> in-process — see
+> [ADR 0019](0019-mongodb-queue-and-in-process-runner.md).
+>
+> This record is kept because the reasoning below explains why Redis was adopted
+> in the first place, and reading it against ADR 0019 is how the reversal becomes
+> legible: the second argument for Redis turned out to rest on a premise that did
+> not hold. See "Why this was reversed" at the end.
 
 ## Context
 
@@ -111,3 +122,26 @@ blocker alongside the licensing gate in
 Never, on the grounds of dependency count alone — Redis is doing two jobs that
 MongoDB does poorly. Revisit only if a specific failure mode appears that
 neither technology handles.
+
+## Why this was reversed
+
+Read against [ADR 0019](0019-mongodb-queue-and-in-process-runner.md), the two
+rejections above resolve differently.
+
+**"MongoDB for the queue — polling latency."** This was the strongest argument
+for Redis, and it is the one that did not survive contact with the code. The
+lease model does not poll for *work*; it polls only while *idle*, and an idle
+poll is a single indexed `FindOneAndUpdate` bounded by `WORKER_CLAIM_POLL_GAP`.
+More decisively, the old queue's durability was not buying anything the scan
+document was not already providing: a scan was written to MongoDB *before* it was
+enqueued, so every queued job already had a document behind it, and the
+reconciler already existed to find documents whose job went missing. Redis was
+carrying a second, redundant record of work MongoDB already knew about.
+
+**"In-process rate limiting — per-instance limits."** This rejection was correct
+as written and remains correct. It is the one cost
+[ADR 0019](0019-mongodb-queue-and-in-process-runner.md) accepts rather than
+solves, recorded there as the reason not to scale this deployment out. It is
+acceptable at one replica and it stays reversed only for as long as that is true.
+
+The third rejection, skipping rate limiting entirely, was never revisited.

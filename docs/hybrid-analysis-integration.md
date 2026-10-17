@@ -238,13 +238,38 @@ code**; each is handled conservatively.
 |---|---|---|
 | V1 | Actual string values of `SampleSummary.verdict` | Mapped from the only documented vocabulary (search filter). Unrecognised → `unknown` |
 | V2 | Meaning of `threat_level` (integer) | Not used |
-| V3 | Do the read-side strings match the search-filter names? | **Needs one live call to confirm.** If not, update the table — do not widen it by guessing |
+| V3 | Do the read-side strings match the search-filter names? | **Confirmed for one value on 2026-10-17** (see below). The other four stay mapped from the documented vocabulary; if a later live call contradicts it, update the table — do not widen it by guessing |
 | V4 | Specific 4xx/5xx codes | Conventional HTTP semantics applied; documented as an assumption |
 | V5 | Is `Retry-After` sent on 429, and in what format? | Parsed if present, otherwise computed backoff |
-| V6 | Rate limits and burst behaviour | Not assumed; bounded retries only |
+| V6 | Rate limits and burst behaviour | Not assumed; bounded retries only. The live `Api-Limits` header reported `minute:200, hour:2000`, but that header is not in the specification |
 | V7 | Idempotency token for submission | **None exists.** Submissions are never retried |
 | V8 | Retention terms for submitted URLs | Unknown — see ADR 0010 |
-| V9 | Does the key tier permit automated submission? | **Unknown — blocks commercial release.** See [ADR 0010](decisions/0010-hybrid-analysis-licensing.md) |
+| V9 | Does the key tier permit automated submission? | **Permission confirmed for this key on 2026-10-17** (`auth_level_name: restricted`, submission accepted). **Licensing is still unresolved — blocks commercial release.** See [ADR 0010](decisions/0010-hybrid-analysis-licensing.md) |
+
+### What the 2026-10-17 live run established
+
+One controlled submission of `https://example.com/cyberguard-live-test`
+through `POST /api/v1/check-url`, in environment 140:
+
+- The key authenticates and holds `restricted` auth level, which is what
+  `/submit/url`, `/report/{id}/*` and `/key/*` are marked as requiring.
+- Submission quota: 100/day, 0 used before, 1 used after — one submission, no
+  retries.
+- The 201 body carried `job_id` **and** `submission_id`, and the response
+  decoded against `SubmissionStatus` without a `submission_type` property.
+- `GET /report/{id}/state` returned `state: "SUCCESS"`, no `error_type`,
+  no `error_origin`, and an empty `related_reports`.
+- `GET /report/{id}/summary` returned **exactly 55 properties**, matching the
+  specification's `SampleSummary` one for one, with
+  `"verdict": "no specific threat"`, `"url_analysis": true`,
+  `"threat_level": 0`, `"av_detect": null`.
+
+That last line is what closes V3 for the one value it exercises, and it is also
+what exposed the decoding defect described in
+[`verified/hybrid-analysis-v2-contract.md`](verified/hybrid-analysis-v2-contract.md):
+the adapter had declared 10 of those 55 properties while decoding with
+`DisallowUnknownFields`, so this perfectly ordinary response was rejected as
+malformed.
 
 ### How to close V1–V3
 

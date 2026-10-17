@@ -8,7 +8,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +16,8 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
+	"cyberguard/server/internal/platform/mongoqueue"
 	"cyberguard/server/internal/platform/mongostore"
-	"cyberguard/server/internal/platform/redisqueue"
 	"cyberguard/server/internal/providers"
 	"cyberguard/server/internal/providers/mock"
 	"cyberguard/server/internal/scans"
@@ -26,9 +25,9 @@ import (
 	"cyberguard/server/internal/verdicts"
 )
 
-// The full workflow against real MongoDB and real Redis:
+// The full workflow against real MongoDB:
 //
-//	docker compose up -d mongodb redis
+//	docker compose up -d mongodb
 //	docker compose run --rm go go test -tags integration ./internal/scans/...
 //
 // The provider is the mock. No test here contacts Hybrid Analysis.
@@ -44,7 +43,7 @@ var liveKey = []byte("integration-key-0123456789abcdef")
 type live struct {
 	svc   *scans.Service
 	store *mongostore.Store
-	queue *redisqueue.Client
+	queue *mongoqueue.Queue
 	db    string
 }
 
@@ -71,18 +70,18 @@ func newLive(t *testing.T, opts ...func(*scans.Options)) *live {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}
 
-	// A separate logical database from the running application. These tests
-	// drain and measure the queue, so sharing it with a live worker would mean
-	// racing it for every job.
-	queue, err := redisqueue.Connect(ctx, redisqueue.Options{
-		Addr:        redisAddr(),
-		DB:          testRedisDB_SCAN(),
-		PingTimeout: 3 * time.Second,
+	// The queue is the same scans collection these tests already use, so it
+	// cannot race anything: the lease is what separates the two claimants, and
+	// only one consumer runs here.
+	queue, err := mongoqueue.New(mongoqueue.Options{
+		Store:         store,
+		Owner:         "integration/" + db,
+		LeaseDuration: 5 * time.Minute,
+		PollGap:       5 * time.Millisecond,
 	})
 	if err != nil {
-		t.Fatalf("redis: %v", err)
+		t.Fatalf("queue: %v", err)
 	}
-	t.Cleanup(func() { _ = queue.Close() })
 
 	aead, err := mongostore.NewTransientURLCipher(liveKey)
 	if err != nil {
@@ -173,28 +172,20 @@ func liveDB(t *testing.T) string {
 	return name
 }
 
-// drainQueue empties the queue, so one test cannot see another's jobs. Redis is
-// shared, so isolation is the test's job rather than the server's.
-func (l *live) drainQueue(t *testing.T) {
+// claimable reports whether a scan is currently claimable, by trying to claim
+// it.
+//
+// There is no queue depth to observe: the scans collection is the queue, and
+// each test gets its own database, so there is nothing for a drain to isolate
+// against. Asking the store the same question the runner asks keeps the test
+// honest about what it is proving.
+func (l *live) claimable(t *testing.T, scanID string) bool {
 	t.Helper()
-	for range 500 {
-		n, err := l.queue.Depth(t.Context())
-		if err != nil || n == 0 {
-			return
-		}
-		if _, err := l.queue.Claim(t.Context(), 100*time.Millisecond); err != nil {
-			return
-		}
-	}
-}
-
-func (l *live) depth(t *testing.T) int64 {
-	t.Helper()
-	n, err := l.queue.Depth(t.Context())
+	scan, err := l.store.ClaimNextScan(t.Context(), time.Now().UTC(), time.Minute, "probe")
 	if err != nil {
-		t.Fatalf("Depth: %v", err)
+		return false
 	}
-	return n
+	return scan.ScanID == scanID
 }
 
 // waitFor polls until the scan reaches a terminal state or the budget runs out.
@@ -245,7 +236,6 @@ func (l *live) documentsIn(t *testing.T, collection string) []bson.M {
 // the provider, poll, normalise, cache, and read back through the status API.
 func TestEndToEndAgainstLiveDatastores(t *testing.T) {
 	l := newLive(t)
-	l.drainQueue(t)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -322,7 +312,6 @@ func TestEndToEndAgainstLiveDatastores(t *testing.T) {
 // index is what deduplicates, under real concurrency.
 func TestLiveConcurrentSubmissionsCreateOneScan(t *testing.T) {
 	l := newLive(t)
-	l.drainQueue(t)
 
 	const target = "https://race.example.test/submit"
 	const n = 20
@@ -366,21 +355,26 @@ func TestLiveConcurrentSubmissionsCreateOneScan(t *testing.T) {
 // the durability claim the whole design rests on.
 func TestLiveStalledScanIsRecovered(t *testing.T) {
 	l := newLive(t)
-	l.drainQueue(t)
 
 	outcome, err := l.svc.Submit(t.Context(), "https://stall.example.test/job")
 	if err != nil {
 		t.Fatalf("Submit: %v", err)
 	}
-	// The message is lost, but the scan is still durably recorded.
-	l.drainQueue(t)
+	// Simulate a consumer that claimed the scan and then died: take a lease and
+	// never release it. The work is not lost — it is held — which is the whole
+	// reason the lease is time-bounded rather than permanent.
+	if _, err := l.store.ClaimNextScan(t.Context(), time.Now().UTC(), 50*time.Millisecond, "dead-consumer"); err != nil {
+		t.Fatalf("ClaimNextScan: %v", err)
+	}
+	if l.claimable(t, outcome.Scan.ScanID) {
+		t.Error("a scan under a live lease was claimable")
+	}
 
-	// Let the scan age past the stall threshold, which is what a crashed
-	// worker would do with real time passing.
-	time.Sleep(20 * time.Millisecond)
+	// The lease lapses. No sweeper runs; the clock does the recovery.
+	time.Sleep(60 * time.Millisecond)
 	l.svc.Reconcile(t.Context())
-	if got := l.depth(t); got != 1 {
-		t.Fatalf("queue depth after recovery = %d, want 1", got)
+	if !l.claimable(t, outcome.Scan.ScanID) {
+		t.Error("the scan was not returned to the pool when its lease lapsed")
 	}
 
 	l.svc.Process(t.Context(), outcome.Scan.ScanID)
@@ -390,11 +384,13 @@ func TestLiveStalledScanIsRecovered(t *testing.T) {
 	}
 }
 
-// The Redis queue holds scan identifiers and nothing else, verified against a
-// live server rather than by reading the code.
-func TestLiveQueueHoldsOnlyScanIdentifiers(t *testing.T) {
+// What the queue hands out is a scan identifier and nothing else.
+//
+// The queue used to be a separate broker whose payload had to be proven inert.
+// It is now the scans collection, so the property is structural — but it is still
+// worth asserting against a live store rather than trusting the argument.
+func TestLiveClaimYieldsOnlyAScanIdentifier(t *testing.T) {
 	l := newLive(t)
-	l.drainQueue(t)
 
 	const target = "https://queue.example.test/secret?q=token"
 	if _, err := l.svc.Submit(t.Context(), target); err != nil {
@@ -406,15 +402,15 @@ func TestLiveQueueHoldsOnlyScanIdentifiers(t *testing.T) {
 		t.Fatalf("Claim: %v", err)
 	}
 	if !strings.HasPrefix(job.ScanID, "scan_") {
-		t.Errorf("queue payload %q is not a scan identifier", job.ScanID)
+		t.Errorf("claim payload %q is not a scan identifier", job.ScanID)
 	}
 	for _, leak := range []string{"queue.example.test", "token", "secret"} {
 		if strings.Contains(job.ScanID, leak) {
-			t.Errorf("the queue payload leaked %q: %s", leak, job.ScanID)
+			t.Errorf("the claim leaked %q: %s", leak, job.ScanID)
 		}
 	}
 	if len(job.ScanID) > 64 {
-		t.Errorf("the queue payload is %d characters, over the documented limit", len(job.ScanID))
+		t.Errorf("the claim is %d characters, over the documented limit", len(job.ScanID))
 	}
 }
 
@@ -591,8 +587,7 @@ func (l *live) storeTarget(t *testing.T, scanID string) (scheme, path string, ok
 	return "", "", false
 }
 
-func mongoURI() string  { return envOr("MONGODB_URI", "mongodb://mongodb:27017") }
-func redisAddr() string { return envOr("REDIS_ADDR", "redis:6379") }
+func mongoURI() string { return envOr("MONGODB_URI", "mongodb://mongodb:27017") }
 
 func envOr(key, def string) string {
 	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
@@ -602,23 +597,6 @@ func envOr(key, def string) string {
 }
 
 // ----------------------------------------------------------- test settings
-
-// testRedisDB_SCAN is the Redis logical database for these end-to-end tests.
-//
-// It is separate from the application's so a test run cannot disturb a live
-// deployment, and separate from the other packages' databases because
-// `go test ./...` runs packages concurrently and every one of them flushes.
-func testRedisDB_SCAN() int {
-	raw := strings.TrimSpace(os.Getenv("REDIS_TEST_DB_SCAN"))
-	if raw == "" {
-		return 3
-	}
-	n, err := strconv.Atoi(raw)
-	if err != nil || n < 0 {
-		return 3
-	}
-	return n
-}
 
 // liveFingerprintOf computes the fingerprint the *integration* harness uses.
 //
@@ -631,4 +609,226 @@ func liveFingerprintOf(t *testing.T, raw string) string {
 		t.Fatalf("fingerprint %q: %v", raw, err)
 	}
 	return fp
+}
+
+// ---------------------------------------------------- lookup by URL
+
+// A URL must resolve to its scan without the caller ever having kept the scan
+// ID. This is the whole point of the endpoint, and it only works if the
+// fingerprint a lookup computes is byte-identical to the one a submission
+// computed.
+func TestLookupByURLFindsTheScanWithoutItsID(t *testing.T) {
+	l := newLive(t)
+
+	const target = "https://lookup.example.test/login"
+	outcome, err := l.svc.Submit(t.Context(), target)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	l.svc.Process(t.Context(), outcome.Scan.ScanID)
+
+	byID, err := l.svc.Lookup(t.Context(), outcome.Scan.ScanID)
+	if err != nil {
+		t.Fatalf("Lookup by id: %v", err)
+	}
+
+	byURL, err := l.svc.LookupByURL(t.Context(), target)
+	if err != nil {
+		t.Fatalf("LookupByURL: %v", err)
+	}
+
+	if byURL.Scan.ScanID != byID.Scan.ScanID {
+		t.Errorf("lookup by URL returned scan %q, by id returned %q",
+			byURL.Scan.ScanID, byID.Scan.ScanID)
+	}
+	if byURL.Scan.Status != byID.Scan.Status {
+		t.Errorf("status by URL = %q, by id = %q", byURL.Scan.Status, byID.Scan.Status)
+	}
+	if (byURL.Assessment == nil) != (byID.Assessment == nil) {
+		t.Error("one entry point attached an assessment and the other did not")
+	}
+}
+
+// A lookup must agree with check-url about what is acceptable. These are the
+// same rules, and they must stay the same, or a client that submits and then
+// polls by URL gets contradictory answers about its own input.
+func TestLookupByURLRejectsExactlyWhatSubmitRejects(t *testing.T) {
+	l := newLive(t)
+
+	cases := []struct {
+		name string
+		url  string
+	}{
+		{"empty", ""},
+		{"unsupported scheme", "ftp://lookup.example.test/x"},
+		{"no scheme", "lookup.example.test/x"},
+		{"loopback", "http://127.0.0.1/x"},
+		{"private", "https://10.1.2.3/x"},
+		{"link local metadata", "https://169.254.169.254/latest/meta-data/"},
+		{"single label", "https://intranet/x"},
+		{"embedded credentials", "https://u:p@lookup.example.test/x"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, submitErr := l.svc.Submit(t.Context(), tc.url)
+			_, lookupErr := l.svc.LookupByURL(t.Context(), tc.url)
+
+			if submitErr == nil {
+				t.Fatalf("%s: Submit accepted it, so this is not a rejected case", tc.name)
+			}
+			if lookupErr == nil {
+				t.Fatalf("%s: LookupByURL accepted what Submit refused", tc.name)
+			}
+
+			// Same classification, not merely the same rejection.
+			if urlintel.IsValidation(submitErr) != urlintel.IsValidation(lookupErr) {
+				t.Errorf("%s: Submit gave %v, LookupByURL gave %v",
+					tc.name, submitErr, lookupErr)
+			}
+			if errors.Is(submitErr, scans.ErrDisallowedTarget) !=
+				errors.Is(lookupErr, scans.ErrDisallowedTarget) {
+				t.Errorf("%s: target gate disagrees; Submit %v, LookupByURL %v",
+					tc.name, submitErr, lookupErr)
+			}
+		})
+	}
+}
+
+// A URL with no scan at all must be a clean not-found, never an empty success.
+func TestLookupByURLReportsAnUnknownURL(t *testing.T) {
+	l := newLive(t)
+
+	_, err := l.svc.LookupByURL(t.Context(), "https://never-submitted.example.test/x")
+	if !errors.Is(err, mongostore.ErrScanNotFound) {
+		t.Fatalf("LookupByURL = %v, want ErrScanNotFound", err)
+	}
+}
+
+// A lookup must be a read. If it created anything, the endpoint would be a
+// second submission path with no quota accounting of its own.
+func TestLookupByURLWritesNothing(t *testing.T) {
+	l := newLive(t)
+
+	const target = "https://readonly.example.test/login"
+	before := l.countDocs(t, mongostore.CollectionScans)
+
+	for range 3 {
+		_, _ = l.svc.LookupByURL(t.Context(), target)
+	}
+
+	if after := l.countDocs(t, mongostore.CollectionScans); after != before {
+		t.Errorf("scan count changed from %d to %d during lookups", before, after)
+	}
+	if n := l.countDocs(t, mongostore.CollectionTransientURLs); n != 0 {
+		t.Errorf("%d transient URL rows exist; a lookup must not store the URL", n)
+	}
+}
+
+// An expired verdict must be omitted rather than served, exactly as on the
+// by-ID path. Both entry points share one rule so they cannot drift.
+func TestLookupByURLOmitsAnExpiredVerdict(t *testing.T) {
+	l := newLive(t)
+
+	const target = "https://expiring.example.test/login"
+	outcome, err := l.svc.Submit(t.Context(), target)
+	if err != nil {
+		t.Fatalf("Submit: %v", err)
+	}
+	l.svc.Process(t.Context(), outcome.Scan.ScanID)
+
+	before, err := l.svc.LookupByURL(t.Context(), target)
+	if err != nil {
+		t.Fatalf("LookupByURL: %v", err)
+	}
+	if before.Assessment == nil {
+		t.Skip("the live provider produced no fresh assessment for this URL")
+	}
+
+	if err := l.expireAssessment(t, liveFingerprintOf(t, target)); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	after, err := l.svc.LookupByURL(t.Context(), target)
+	if err != nil {
+		t.Fatalf("LookupByURL after expiry: %v", err)
+	}
+	if after.Assessment != nil {
+		t.Errorf("an expired verdict was served: %+v", after.Assessment)
+	}
+	if after.Scan.Status != mongostore.ScanCompleted {
+		t.Errorf("status = %q; the scan really did complete", after.Scan.Status)
+	}
+}
+
+// The most recent scan wins, even when an older completed one exists.
+//
+// Preferring the older completed scan would report a verdict while a fresh
+// analysis of the same URL was still running, which answers a question the
+// caller did not ask.
+func TestLookupByURLReturnsTheMostRecentScan(t *testing.T) {
+	l := newLive(t)
+
+	const target = "https://recent.example.test/login"
+
+	first, err := l.svc.Submit(t.Context(), target)
+	if err != nil {
+		t.Fatalf("first Submit: %v", err)
+	}
+	l.svc.Process(t.Context(), first.Scan.ScanID)
+
+	// Expire the assessment so the next submission is not deduplicated onto it.
+	if err := l.expireAssessment(t, liveFingerprintOf(t, target)); err != nil {
+		t.Fatalf("expire: %v", err)
+	}
+
+	second, err := l.svc.Submit(t.Context(), target)
+	if err != nil {
+		t.Fatalf("second Submit: %v", err)
+	}
+	if second.Scan.ScanID == first.Scan.ScanID {
+		t.Skip("the second submission was deduplicated; this needs two distinct scans")
+	}
+	l.svc.Process(t.Context(), second.Scan.ScanID)
+
+	got, err := l.svc.LookupByURL(t.Context(), target)
+	if err != nil {
+		t.Fatalf("LookupByURL: %v", err)
+	}
+	if got.Scan.ScanID != second.Scan.ScanID {
+		t.Errorf("returned scan %q, want the most recent %q",
+			got.Scan.ScanID, second.Scan.ScanID)
+	}
+}
+
+// expireAssessment forces an assessment past its freshness window.
+//
+// It writes expires_at in the past rather than waiting, so the test does not
+// depend on a TTL reaper's timing — which runs about once a minute and is
+// exactly the kind of thing a test must not race.
+func (l *live) expireAssessment(t *testing.T, fingerprint string) error {
+	t.Helper()
+
+	client, err := mongo.Connect(options.Client().ApplyURI(mongoURI()))
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { _ = client.Disconnect(context.Background()) }()
+
+	res, err := client.Database(l.db).Collection(mongostore.CollectionAssessments).
+		UpdateOne(t.Context(), bson.M{"_id": fingerprint},
+			bson.M{"$set": bson.M{"expires_at": time.Now().UTC().Add(-time.Hour)}})
+	if err != nil {
+		return err
+	}
+	if res.MatchedCount == 0 {
+		return errors.New("no assessment to expire for fingerprint " + fingerprint)
+	}
+	return nil
+}
+
+// countDocs counts documents in one of this harness's collections.
+func (l *live) countDocs(t *testing.T, collection string) int64 {
+	t.Helper()
+	return int64(len(l.documentsIn(t, collection)))
 }

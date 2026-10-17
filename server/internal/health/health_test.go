@@ -30,7 +30,7 @@ func TestCheckerReportsEveryDependency(t *testing.T) {
 
 	checker := NewChecker(time.Second,
 		Named{Name: "mongodb", Check: stubCheck{}},
-		Named{Name: "redis", Check: stubCheck{}},
+		Named{Name: "provider_registry", Check: stubCheck{}},
 	)
 
 	ready, reports := checker.Run(t.Context())
@@ -56,7 +56,7 @@ func TestCheckerFailsWhenAnyDependencyIsDown(t *testing.T) {
 
 	checker := NewChecker(time.Second,
 		Named{Name: "mongodb", Check: stubCheck{}},
-		Named{Name: "redis", Check: stubCheck{err: errors.New("connection refused: redis://admin:hunter2@redis:6379")}},
+		Named{Name: "provider_registry", Check: stubCheck{err: errors.New("dial tcp: connection refused: credentials must not appear")}},
 	)
 
 	ready, reports := checker.Run(t.Context())
@@ -65,22 +65,22 @@ func TestCheckerFailsWhenAnyDependencyIsDown(t *testing.T) {
 		t.Error("Run reported ready with a dependency down")
 	}
 
-	var redisReport *Report
+	var registryReport *Report
 	for i := range reports {
-		if reports[i].Name == "redis" {
-			redisReport = &reports[i]
+		if reports[i].Name == "provider_registry" {
+			registryReport = &reports[i]
 		}
 	}
-	if redisReport == nil {
+	if registryReport == nil {
 		t.Fatal("no report for the failed dependency")
 	}
-	if redisReport.OK {
-		t.Error("redis report is ok despite a failing probe")
+	if registryReport.OK {
+		t.Error("the report is ok despite a failing probe")
 	}
 
 	// This endpoint is unauthenticated, so the payload must not carry driver
 	// error text, which can embed hosts, topology and credentials.
-	if contains := redisReport.Why; contains == "" {
+	if contains := registryReport.Why; contains == "" {
 		t.Error("failed check has no why")
 	} else if len(contains) != len("dependency unavailable") {
 		t.Errorf("why = %q, want the generic message with no driver detail", contains)

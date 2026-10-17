@@ -50,6 +50,7 @@ func rulesetFixture(digest string, rules int) mongostore.Ruleset {
 			Provenance: mongostore.RuleProvenance{
 				Fingerprint: "fingerprint-for-audit-not-publish",
 				Scope:       "exact_url",
+				Action:      "block",
 			},
 		})
 	}
@@ -436,7 +437,7 @@ func TestRecordScanTargetStoresThenClears(t *testing.T) {
 		t.Fatalf("CreateScan: %v", err)
 	}
 
-	if err := store.RecordScanTarget(context.Background(), "scan-1", "https", "/login", false); err != nil {
+	if err := store.RecordScanTarget(context.Background(), "scan-1", "https", "", "/login", false); err != nil {
 		t.Fatalf("RecordScanTarget: %v", err)
 	}
 
@@ -448,7 +449,7 @@ func TestRecordScanTargetStoresThenClears(t *testing.T) {
 		t.Fatalf("the target detail was not stored: %+v", scan)
 	}
 
-	if err := store.RecordScanTarget(context.Background(), "scan-1", "", "", true); err != nil {
+	if err := store.RecordScanTarget(context.Background(), "scan-1", "", "", "", true); err != nil {
 		t.Fatalf("clear: %v", err)
 	}
 
@@ -456,7 +457,119 @@ func TestRecordScanTargetStoresThenClears(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetScan: %v", err)
 	}
-	if scan.Scheme != "" || scan.PathPrefix != "" {
+	if scan.Scheme != "" || scan.Port != "" || scan.PathPrefix != "" {
 		t.Errorf("the target detail survived the clear: %+v", scan)
+	}
+}
+
+// A redirect must survive a round trip through MongoDB.
+//
+// The redirect member is what tells a client to send the user to an interstitial
+// rather than block the request, so a ruleset that loses it silently reverts to
+// blocking. That is a behaviour change the client cannot see coming.
+func TestRedirectActionRoundTrips(t *testing.T) {
+	store := newRulesetStore(t)
+
+	rs := mongostore.Ruleset{
+		GeneratedAt: time.Now().UTC(),
+		Digest:      "redirect-digest",
+		Rules: []mongostore.Rule{{
+			ID:       1,
+			Priority: 1,
+			Action: mongostore.RuleAction{
+				Type:     "redirect",
+				Redirect: &mongostore.Redirect{ExtensionPath: "/locked.html"},
+			},
+			Condition: mongostore.RuleCondition{
+				URLFilter:     "||evil.test^",
+				ResourceTypes: []string{"main_frame", "sub_frame"},
+			},
+		}},
+	}
+
+	if _, _, err := store.PublishRuleset(context.Background(), rs); err != nil {
+		t.Fatalf("PublishRuleset: %v", err)
+	}
+
+	got, err := store.CurrentRuleset(context.Background())
+	if err != nil {
+		t.Fatalf("CurrentRuleset: %v", err)
+	}
+	if len(got.Rules) != 1 {
+		t.Fatalf("got %d rules, want 1", len(got.Rules))
+	}
+	if got.Rules[0].Action.Type != "redirect" {
+		t.Errorf("action.type = %q, want redirect", got.Rules[0].Action.Type)
+	}
+	if got.Rules[0].Action.Redirect == nil {
+		t.Fatal("the redirect member was lost in storage")
+	}
+	if got.Rules[0].Action.Redirect.ExtensionPath != "/locked.html" {
+		t.Errorf("extensionPath = %q, want /locked.html", got.Rules[0].Action.Redirect.ExtensionPath)
+	}
+}
+
+// A block action must not acquire a redirect member in storage, so a client can
+// rely on the member's absence.
+func TestBlockActionNeverCarriesARedirectInStorage(t *testing.T) {
+	store := newRulesetStore(t)
+
+	rs, _, err := store.PublishRuleset(context.Background(), mongostore.Ruleset{
+		GeneratedAt: time.Now().UTC(),
+		Digest:      "block-digest",
+		Rules: []mongostore.Rule{{
+			ID:       1,
+			Priority: 1,
+			Action:   mongostore.RuleAction{Type: "block"},
+			Condition: mongostore.RuleCondition{
+				URLFilter: "||evil.test^", ResourceTypes: []string{"main_frame"},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("PublishRuleset: %v", err)
+	}
+	if rs.Rules[0].Action.Redirect != nil {
+		t.Error("a block rule was stored with a redirect member")
+	}
+}
+
+// Switching from block to redirect must produce a new version.
+//
+// If the digest ignored the action, a deployment that changed the action would
+// keep serving the old ruleset, and every client would carry block rules while
+// the operator believed the interstitial was live.
+func TestChangingTheActionPublishesANewVersion(t *testing.T) {
+	store := newRulesetStore(t)
+
+	_, _, err := store.PublishRuleset(context.Background(), mongostore.Ruleset{
+		GeneratedAt: time.Now().UTC(), Digest: "digest-block",
+		Rules: []mongostore.Rule{{
+			ID: 1, Priority: 1, Action: mongostore.RuleAction{Type: "block"},
+			Condition: mongostore.RuleCondition{URLFilter: "||evil.test^", ResourceTypes: []string{"main_frame"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("first publish: %v", err)
+	}
+
+	second, created, err := store.PublishRuleset(context.Background(), mongostore.Ruleset{
+		GeneratedAt: time.Now().UTC(), Digest: "digest-redirect",
+		Rules: []mongostore.Rule{{
+			ID: 1, Priority: 1,
+			Action: mongostore.RuleAction{
+				Type: "redirect", Redirect: &mongostore.Redirect{ExtensionPath: "/locked.html"},
+			},
+			Condition: mongostore.RuleCondition{URLFilter: "||evil.test^", ResourceTypes: []string{"main_frame"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("second publish: %v", err)
+	}
+	if !created {
+		t.Error("changing the action did not publish a new version")
+	}
+	if second.Version != 2 {
+		t.Errorf("version = %d, want 2", second.Version)
 	}
 }

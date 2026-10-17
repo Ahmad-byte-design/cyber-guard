@@ -21,6 +21,29 @@ so a future maintainer can tell verified behaviour from assumption.
 The earlier working note claiming a `user-agent` header requirement was **wrong**
 and has been removed. The adapter sends only the documented `api-key` header.
 
+> **Live verification 2026-10-17.** Re-fetched from the same URL; still OpenAPI
+> `3.0.0`, still `api-version: 2.38.0`, `webservice-version: 28.0.0`. The
+> declared base URL answers directly; `https://www.hybrid-analysis.com/...`
+> answers `301`, so the no-`www` form is the one to configure.
+>
+> `GET /key/submission-quota` and `GET /system/environments` both return `200`
+> with the configured key, so the `restricted` auth level those operations
+> require is satisfied.
+>
+> **`GET /key/current` returns the API key in its response body.** That makes it
+> a credential-echoing endpoint: anything that logs it leaks the secret. No code
+> in this package calls it, and nothing should. It is listed here so the
+> hazard is documented rather than rediscovered.
+
+### What strict decoding costs on a wide schema
+
+`SampleSummary` declares 55 properties and the adapter reads 10. Decoding with
+`DisallowUnknownFields` means the *declared* set has to be the *documented*
+set, not the *used* set — otherwise a perfectly ordinary completed report is
+rejected with `json: unknown field "environment_description"` and every verdict
+is lost. `contract_test.go` pins the two sets together so the drift is a test
+failure rather than a production incident.
+
 ## `POST /submit/url` — submit a URL for analysis
 
 | Fact | Value |
@@ -93,15 +116,25 @@ clean result.
 
 ## `GET /report/{id}/summary` — the report summary
 
-Returns `SampleSummary`. Fields this project uses:
+Returns `SampleSummary`. **This schema declares 55 properties**, of which the
+adapter reads the ones below. All 55 are declared in the Go struct, because the
+adapter decodes with `DisallowUnknownFields` and an undeclared *documented*
+property rejects the whole response.
 
 | Field | Type | Use |
 |---|---|---|
 | `state` | string, nullable | Terminal-state confirmation |
 | `verdict` | **string, nullable** | Provider classification — see below |
 | `threat_level` | integer, nullable | Documented type, **undocumented meaning** |
-| `av_detect` | string | AV detection string |
+| `av_detect` | integer, nullable | AV multiscan range (0–100). Corrected 2026-10-17: an earlier revision of this file recorded it as a string; the specification declares `integer` |
+| `threat_score` | integer, nullable | Declared, unread |
+| `url_analysis` | boolean, nullable | Declared, unread |
+| `job_id`, `environment_id` | string / integer, nullable | Declared, unread |
 | `error_type`, `error_origin` | string, nullable | Failure diagnostics |
+
+Fields the adapter declares but does not read are typed `json.RawMessage`: a
+type drift in a field nobody consumes must not be able to block a verdict,
+while its absence from the specification still is caught.
 
 ### The `verdict` field — the one genuine ambiguity
 
@@ -127,8 +160,14 @@ vocabulary. The adapter therefore:
 2. Maps nothing else. An unrecognised string yields `unknown`.
 3. Never invents a sixth name.
 
-**This must be confirmed against a live API key before the mapping is trusted**
-— see open question V3 in [`../hybrid-analysis-integration.md`](../hybrid-analysis-integration.md).
+**Confirmed against a live key on 2026-10-17.** A completed URL analysis in
+environment 140 returned `"verdict": "no specific threat"` — byte-identical to
+the documented search-filter name for value 3. That confirms one read-side value
+matches the documented vocabulary; the other four remain unobserved, because
+observing them would mean submitting a malicious sample, which is not a thing to
+do to a shared service account. The mapping therefore stays restricted to the
+five documented names, and anything else still yields `unknown`. See open
+question V3 in [`../hybrid-analysis-integration.md`](../hybrid-analysis-integration.md).
 
 ## `GET /key/submission-quota`
 
@@ -170,17 +209,17 @@ deliberate, documented assumption:
 
 These are open questions, not assumptions this code silently makes.
 
-| # | Question |
-|---|---|
-| V1 | Actual string values of `SampleSummary.verdict`. Only the search-filter vocabulary is documented |
-| V2 | Semantics of `threat_level` (integer). Type is documented, meaning is not |
-| V3 | Whether the read-side `verdict` strings match the search-filter names |
-| V4 | Specific error status codes. Only `default` is declared |
-| V5 | Whether `Retry-After` is honoured on `429`, and its format |
-| V6 | Rate limits and burst behaviour |
-| V7 | Whether `POST /submit/url` supports any idempotency or deduplication token. **The specification declares none** |
-| V8 | Retention terms for submitted URLs |
-| V9 | Whether a key tier permits automated submission |
+| # | Question | Status 2026-10-17 |
+|---|---|---|
+| V1 | Actual string values of `SampleSummary.verdict`. Only the search-filter vocabulary is documented | **Partly answered.** `"no specific threat"` observed. `malicious`, `suspicious`, `whitelisted`, `no verdict` unobserved |
+| V2 | Semantics of `threat_level` (integer). Type is documented, meaning is not | Open. Observed `0` on a benign URL; that is not a definition |
+| V3 | Whether the read-side `verdict` strings match the search-filter names | **Answered for one value.** `"no specific threat"` is byte-identical to the documented name. The other four remain inferred from the filter vocabulary, and the adapter maps nothing beyond those five names |
+| V4 | Specific error status codes. Only `default` is declared | Open. No error status was observed; the conventional mapping stands as a documented assumption |
+| V5 | Whether `Retry-After` is honoured on `429`, and its format | Open. Never rate limited during verification |
+| V6 | Rate limits and burst behaviour | **Partly answered.** The `Api-Limits` header on a live response reported `{"limits":{"minute":200,"hour":2000},"used":{"minute":1,"hour":1},"limit_reached":false}`. The header is **not declared** in the specification, so it is an observed implementation detail, not a contract |
+| V7 | Whether `POST /submit/url` supports any idempotency or deduplication token. **The specification declares none** | Open, and unchanged. The adapter still never retries an ambiguous submission |
+| V8 | Retention terms for submitted URLs | Open. A project-level obligation, not an API one — see ADR 0010 |
+| V9 | Whether a key tier permits automated submission | **Answered in the affirmative for this key.** `GET /key/current` reports `auth_level: 1`, `auth_level_name: "restricted"`, and `/submit/url` — which the specification marks `x-auth-level: restricted` — accepted the submission. This answers permission, not licence; see ADR 0010 |
 
 ### V7 has a direct design consequence
 

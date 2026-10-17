@@ -1,10 +1,13 @@
 # syntax=docker/dockerfile:1
 #
-# Multi-stage build for the CyberGuard API and worker.
+# Multi-stage build for CyberGuard.
 #
 # Stage 1 compiles a static binary; stage 2 ships only that binary on a bare
 # Alpine base. The build stage never reaches production, so the final image
 # carries no toolchain, no source and no module cache.
+#
+# There is one application binary. The worker used to be a second one; it is now
+# goroutines inside the API, so there is nothing extra to ship or keep in sync.
 #
 # Build:  docker compose build backend
 # Run:    docker compose up -d
@@ -44,10 +47,6 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
  && CGO_ENABLED=0 GOOS=linux go build \
         -trimpath \
         -ldflags="-s -w" \
-        -o /out/worker ./cmd/worker \
- && CGO_ENABLED=0 GOOS=linux go build \
-        -trimpath \
-        -ldflags="-s -w" \
         -o /out/migrate ./cmd/migrate
 
 # -------------------------------------------------------------- runtime stage
@@ -59,7 +58,6 @@ RUN apk add --no-cache ca-certificates tzdata \
  && adduser -D -H -u 1000 cyberguard
 
 COPY --from=build /out/api     /usr/local/bin/cyberguard-api
-COPY --from=build /out/worker  /usr/local/bin/cyberguard-worker
 COPY --from=build /out/migrate /usr/local/bin/cyberguard-migrate
 
 # Run unprivileged. Binding :8080 needs no capabilities, so nothing is granted.

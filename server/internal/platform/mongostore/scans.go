@@ -50,6 +50,15 @@ func (s *Store) CreateScan(ctx context.Context, scan Scan) (Scan, bool, error) {
 	if scan.UpdatedAt.IsZero() {
 		scan.UpdatedAt = scan.CreatedAt
 	}
+	// A new scan is work immediately, so it is due now.
+	//
+	// Setting it here rather than relying on "absent means due" is deliberate:
+	// the claim query has to tolerate an absent available_at anyway, for scans
+	// written before these fields existed, and a query that does two things is
+	// harder to reason about than a query that does one.
+	if scan.AvailableAt == nil && scan.Status == ScanQueued {
+		scan.AvailableAt = &scan.CreatedAt
+	}
 
 	coll := s.db.Collection(CollectionScans)
 	_, err := coll.InsertOne(ctx, scan)
@@ -122,6 +131,46 @@ func (s *Store) FindActiveScanByFingerprint(ctx context.Context, fingerprint str
 		return Scan{}, ErrScanNotFound
 	default:
 		return Scan{}, fmt.Errorf("mongostore: find active scan: %w", err)
+	}
+}
+
+// FindLatestScanByFingerprint returns the most recently created scan for a URL
+// fingerprint, in any status.
+//
+// It backs `POST /api/v1/get-url`, which answers "what happened to this URL"
+// without the caller having kept a scan ID.
+//
+// The newest scan is returned rather than the newest *completed* one. A caller
+// asking about a URL right now wants the current state of that URL, and
+// preferring an older completed scan over a newer in-flight one would report a
+// verdict as the answer while a fresh analysis of the same URL is still
+// running. It also keeps the rule simple enough to state in one sentence.
+//
+// Scans accumulate per fingerprint across freshness windows, so this needs an
+// index that is not the partial active-scan one; see idxScansFingerprintRecent.
+func (s *Store) FindLatestScanByFingerprint(ctx context.Context, fingerprint string) (Scan, error) {
+	if s == nil || s.db == nil {
+		return Scan{}, ErrClosed
+	}
+	if fingerprint == "" {
+		return Scan{}, ErrScanNotFound
+	}
+
+	var scan Scan
+	err := s.db.Collection(CollectionScans).
+		FindOne(ctx,
+			bson.M{"url_fingerprint": fingerprint},
+			options.FindOne().SetSort(bson.D{{Key: "created_at", Value: -1}}),
+		).
+		Decode(&scan)
+
+	switch {
+	case err == nil:
+		return scan, nil
+	case errors.Is(err, mongo.ErrNoDocuments):
+		return Scan{}, ErrScanNotFound
+	default:
+		return Scan{}, fmt.Errorf("mongostore: find latest scan: %w", err)
 	}
 }
 
@@ -375,7 +424,7 @@ func (s *Store) ListStalledScans(ctx context.Context, olderThan time.Time, limit
 // audit trail from retaining a path fragment for every URL ever scanned.
 //
 // The query string is never accepted. The signature has no parameter for it.
-func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, pathPrefix string, clear bool) error {
+func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, port, pathPrefix string, clear bool) error {
 	if s == nil || s.db == nil {
 		return ErrClosed
 	}
@@ -388,10 +437,12 @@ func (s *Store) RecordScanTarget(ctx context.Context, scanID, scheme, pathPrefix
 		set = bson.M{
 			"updated_at":  time.Now().UTC(),
 			"scheme":      "",
+			"port":        "",
 			"path_prefix": "",
 		}
 	} else {
 		set["scheme"] = scheme
+		set["port"] = port
 		set["path_prefix"] = pathPrefix
 	}
 

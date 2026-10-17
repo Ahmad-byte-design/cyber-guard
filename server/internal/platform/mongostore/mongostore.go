@@ -30,6 +30,12 @@ const (
 // ErrClosed is returned by operations on a Store that has been disconnected.
 var ErrClosed = errors.New("mongostore: store is closed")
 
+// ErrNoClaimableScan means no scan was due to be worked at the moment of the
+// claim. It is an ordinary idle result rather than a failure, so it is
+// deliberately distinct from a query error: a consumer treats it as "poll
+// again shortly" and never reports it as a problem.
+var ErrNoClaimableScan = errors.New("mongostore: no claimable scan")
+
 // Options configures a connection.
 type Options struct {
 	// URI is the MongoDB connection string. It may contain credentials, so it
