@@ -1,0 +1,43 @@
+# Redocly configuration for the OpenAPI contract.
+#
+# The backend does not depend on this file: no Node.js runtime is involved in
+# building or running the service, and CI does not run this linter. It exists so
+# that `npx @redocly/cli lint server/openapi.yaml` gives the same answer for
+# everyone, instead of each developer seeing a different set of rules.
+#
+# CI enforces the contract through Go tests in internal/httpapi
+# (openapi_test.go): that the YAML parses, every path matches a registered
+# route, every $ref resolves, the verdict and scan-status enums equal the code,
+# and no credential appears in the document. Those are the failures this project
+# actually makes, and they need no external tooling to catch.
+#
+# Redocly additionally validates the document against the OpenAPI 3.1 schema,
+# which the Go tests do not do. Run it before publishing a change:
+#
+#   npx @redocly/cli lint server/openapi.yaml
+#
+# Run it from the repository root; the path below is relative to this file.
+
+apis:
+  cyberguard:
+    root: ./openapi.yaml
+
+extends:
+  - recommended
+
+rules:
+  # `/docs/` keeps its trailing slash, deliberately.
+  #
+  # The page loads its stylesheet, scripts and specification with URLs relative
+  # to itself. Served from `/docs/`, `assets/swagger-ui.css` resolves to
+  # `/docs/assets/swagger-ui.css` and `../openapi.yaml` to `/openapi.yaml` —
+  # correct, and independent of the host, port or path prefix the service is
+  # reached through. Served from `/docs`, the same relative URLs would resolve
+  # to `/assets/swagger-ui.css` and `/openapi.yaml`, and the page would render
+  # unstyled with no contract.
+  #
+  # The rule exists because trailing slashes are commonly stripped by proxies
+  # and CDNs, so a documented path can stop matching. That does not apply here:
+  # the route is registered explicitly, no client in the documented flow
+  # normalises the URL away, and `/docs` and `/docs/` are both served.
+  no-path-trailing-slash: off

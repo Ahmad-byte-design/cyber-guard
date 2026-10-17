@@ -1,0 +1,22 @@
+# --- secrets ---------------------------------------------------------------
+# Local environment and overrides. .env.example is committed; .env is not.
+.env
+.env.*
+!.env.example
+
+# --- Go build/test caches --------------------------------------------------
+/.cache/
+
+# --- build output ----------------------------------------------------------
+/server/bin/
+/server/dist/
+*.exe
+*.test
+coverage.out
+coverage.html
+
+# --- OS / editor -----------------------------------------------------------
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
