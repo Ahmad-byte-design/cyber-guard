@@ -1,149 +1,78 @@
-# CyberGuard AI — local development topology.
+# CyberGuard AI — the whole deployment is two services: the API and MongoDB.
 #
-# Mirrors section 13 of docs/Architecture/CYBERGUARD_PROJECT.md:
-#   backend  Go HTTP API (published on :8080) — also runs the scan pipeline
-#   mongodb  authoritative store and work queue (internal only)
-#
-# The worker service and the Redis service are gone. Job delivery moved into the
-# API as goroutines and the scans collection became the queue, so MongoDB is the
-# only datastore. See docs/decisions/0013-durable-jobs-and-url-privacy.md.
-#
-# MongoDB deliberately publishes no host ports, per section 11.11.
+# There is no worker, no queue and no Redis: a check-url request performs the
+# provider call synchronously inside its own request and stores the result.
 #
 #   docker compose up -d --build      start everything
-#   docker compose logs -f backend     follow API and scan logs
-#   docker compose down                stop
-#   docker compose down -v             stop and delete all data
+#   docker compose logs -f backend    follow the API logs
+#   docker compose down               stop
+#   docker compose down -v            stop and delete all data
+#
+# Run the Go toolchain (build, test, vet, gofmt) on the host module:
+#
+#   docker compose run --rm go test ./...
+#   docker compose run --rm go gofmt -l .
+#   docker compose run --rm go go vet ./...
 
 name: cyberguard
 
-x-app-image: &app-image
-  build:
-    context: ./server
-    dockerfile: Dockerfile
-    args:
-      VERSION: ${VERSION:-dev}
-      COMMIT: ${COMMIT:-unknown}
-      BUILD_TIME: ${BUILD_TIME:-unknown}
-  image: cyberguard-server:dev
-  env_file:
-    - path: .env
-      required: false
-  environment: &app-env
-    HTTP_ADDR: ":8080"
-    LOG_LEVEL: ${LOG_LEVEL:-info}
-    LOG_FORMAT: ${LOG_FORMAT:-json}
-    MONGODB_URI: mongodb://mongodb:27017
-    MONGODB_DATABASE: ${MONGODB_DATABASE:-cyberguard}
-    # Selects the analysis backend. "mock" analyses URLs in-process and needs no
-    # API key; "hybrid-analysis" uses the real service.
-    #
-    # There is no fallback in either direction. This default only applies when
-    # .env omits the setting entirely.
-    ANALYSIS_PROVIDER: ${ANALYSIS_PROVIDER:-mock}
-    # No "www": that is what the v2 specification declares, and that host
-    # answers 301. A wrong base URL fails as a connection error rather than as an
-    # authentication error, which is a confusing way to learn a typo.
-    HYBRID_ANALYSIS_BASE_URL: ${HYBRID_ANALYSIS_BASE_URL:-https://hybrid-analysis.com/api/v2}
-    HYBRID_ANALYSIS_API_KEY: ${HYBRID_ANALYSIS_API_KEY:-}
-    # Sandbox for URL analysis. 140 is Windows 11 64 bit, chosen because
-    # phishing kits target Windows browsers. Listed here rather than left
-    # implicit, so the effective provider settings are readable from this file.
-    HYBRID_ANALYSIS_ENVIRONMENT_ID: ${HYBRID_ANALYSIS_ENVIRONMENT_ID:-140}
-    HYBRID_ANALYSIS_TIMEOUT: ${HYBRID_ANALYSIS_TIMEOUT:-30s}
-    HYBRID_ANALYSIS_MAX_RETRIES: ${HYBRID_ANALYSIS_MAX_RETRIES:-3}
-    HYBRID_ANALYSIS_RETRY_BASE: ${HYBRID_ANALYSIS_RETRY_BASE:-500ms}
-    URL_FINGERPRINT_HMAC_KEY: ${URL_FINGERPRINT_HMAC_KEY:-}
-    # Required. Without it the API refuses submissions and readiness fails,
-    # rather than storing raw URLs in the clear.
-    URL_ENCRYPTION_KEY: ${URL_ENCRYPTION_KEY:-}
-    # Claim pacing and lease sizing for the in-process scan runner.
-    #
-    # The lease must outlive the longest possible unit of work — a provider poll
-    # bounded by WORKER_POLL_DEADLINE — or a second consumer could claim a scan
-    # whose analysis is still running, and on the submission path that means
-    # submitting the URL twice. The lease is derived from the poll deadline plus
-    # CLAIM_LEASE_HEADROOM and validated at startup, so it is stated here for
-    # visibility rather than configured directly.
-    WORKER_POLL_INTERVAL: ${WORKER_POLL_INTERVAL:-5s}
-    WORKER_POLL_DEADLINE: ${WORKER_POLL_DEADLINE:-5m}
-    WORKER_CLAIM_POLL_GAP: ${WORKER_CLAIM_POLL_GAP:-250ms}
-    CLAIM_LEASE_HEADROOM: ${CLAIM_LEASE_HEADROOM:-30s}
-    WORKER_STALL_THRESHOLD: ${WORKER_STALL_THRESHOLD:-2m}
-    # Protection ruleset generation. Defaults mirror .env.example; see ADR 0018
-    # for why the thresholds are provisional.
-    RULESET_ENABLED: ${RULESET_ENABLED:-true}
-    RULESET_MAX_SCOPE: ${RULESET_MAX_SCOPE:-exact_url}
-    RULESET_MIN_CORROBORATION: ${RULESET_MIN_CORROBORATION:-2}
-    RULESET_MIN_CORROBORATION_PREFIX: ${RULESET_MIN_CORROBORATION_PREFIX:-3}
-    RULESET_MIN_CORROBORATION_DOMAIN: ${RULESET_MIN_CORROBORATION_DOMAIN:-5}
-    RULESET_MAX_RULES: ${RULESET_MAX_RULES:-5000}
-    RULESET_REBUILD_INTERVAL: ${RULESET_REBUILD_INTERVAL:-60s}
-    # DNR shape. Action is block (default) or redirect; a redirect needs the
-    # client to declare the page in web_accessible_resources. The regex cap is
-    # Chrome's own limit and must not be raised.
-    RULESET_ACTION: ${RULESET_ACTION:-block}
-    RULESET_REDIRECT_PATH: ${RULESET_REDIRECT_PATH:-/locked.html}
-    RULESET_RESOURCE_PROFILE: ${RULESET_RESOURCE_PROFILE:-navigation_and_active}
-    RULESET_PRIORITY: ${RULESET_PRIORITY:-1}
-    RULESET_MAX_REGEX_RULES: ${RULESET_MAX_REGEX_RULES:-1000}
-    # Serves Swagger UI at /docs/ and the contract at /openapi.yaml. Set to
-    # false if the contract should not be browsable; the API is unaffected
-    # either way, and no credential is involved.
-    API_DOCS_ENABLED: ${API_DOCS_ENABLED:-true}
-  # The schema migration runs first and must succeed. See the migrate service
-  # below for why an unmigrated database is worse than a failed one.
-  depends_on:
-    migrate:
-      condition: service_completed_successfully
-  restart: unless-stopped
-
 services:
-  # One-shot schema step: creates the indexes the repositories rely on, then
-  # exits.
-  #
-  # It is separate from application startup on purpose. Creating indexes on
-  # boot would make every replica restart wait on an index build, and a failed
-  # migration would take the service down instead of reporting a degraded one.
-  #
-  # But running it nowhere is worse than either, because an unmigrated database
-  # fails silently rather than loudly. It has no partial unique index, so "one
-  # provider submission per URL" quietly stops being true — duplicate scans,
-  # duplicate provider submissions, nothing in the logs looking wrong. No TTL
-  # index, so encrypted URLs are never reaped. No cache index, so every verdict
-  # lookup is a collection scan.
-  #
-  # Re-run it any time:  docker compose run --rm migrate
-  # Check without changing anything:  docker compose run --rm migrate -verify
-  migrate:
-    <<: *app-image
-    container_name: cyberguard-migrate
-    entrypoint: ["/usr/local/bin/cyberguard-migrate"]
-    # The image HEALTHCHECK probes the API's HTTP listener, which this one-shot
-    # program never starts.
-    healthcheck:
-      disable: true
-    restart: "no"
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    # Distinct tag: another local project (cyberguard-laravel-*) also builds
+    # `cyberguard-api:local`; a shared tag lets their build swap this API's
+    # image on the next `up`. `--build` always refreshes this tag.
+    image: cyberguard-api:go-local
+    container_name: cyberguard-backend
+    restart: unless-stopped
+    env_file:
+      # The host .env feeds the provider settings (API key, base URL, scan
+      # type, CORS origins). Anything named again under `environment` below
+      # wins: values that must differ inside the Docker network are pinned
+      # there on purpose.
+      - path: .env
+        required: false
+    environment:
+      # The container always listens on 8080 (matching EXPOSE, the image
+      # healthcheck and this port mapping); APP_PORT on the host therefore
+      # only selects which host port publishes it.
+      APP_PORT: ${APP_PORT:-8080}
+      # Inside the Docker network the URI is the service name, never the
+      # value .env carries for host runs (mongodb://localhost:27017), so it is
+      # re-pinned here even though env_file would otherwise supply it.
+      MONGODB_URI: mongodb://mongodb:27017
+      MONGODB_DATABASE: ${MONGODB_DATABASE:-cyberguard}
+      # There is no `www` in the base URL: that is the host the official v2
+      # specification declares, and the www host answers 301 to it. A Go
+      # client does not replay a POST body across the method change a 301
+      # implies, so the declared host is the one that works.
+      HYBRID_ANALYSIS_BASE_URL: ${HYBRID_ANALYSIS_BASE_URL:-https://hybrid-analysis.com/api/v2}
+      HYBRID_ANALYSIS_API_KEY: ${HYBRID_ANALYSIS_API_KEY:-}
+      HYBRID_ANALYSIS_TIMEOUT: ${HYBRID_ANALYSIS_TIMEOUT:-30s}
+      HYBRID_ANALYSIS_SCAN_TYPE: ${HYBRID_ANALYSIS_SCAN_TYPE:-all}
+      # An empty value falls back to the in-code defaults (localhost dev
+      # origins). Listing origins in .env is the normal production setup.
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+    ports:
+      - "${APP_PORT:-8080}:8080"
     depends_on:
       mongodb:
         condition: service_healthy
 
-  backend:
-    <<: *app-image
-    container_name: cyberguard-backend
-    ports:
-      - "8080:8080"
-
-  # Interactive Go toolchain for building and testing on the host side.
-  #   docker compose run --rm go test ./...
-  #   docker compose run --rm go go build ./...
+  # Interactive Go toolchain for building and testing the module as it sits on
+  # the host, without requiring Go on the host itself. It lives under the
+  # "tools" profile, so it never starts with plain `docker compose up`; use
+  # docker compose run (--profile tools where the CLI grumbles) to enter it.
   go:
+    profiles: ["tools"]
     image: golang:1.27-alpine
     working_dir: /src
     volumes:
-      - ./server:/src
-      # Host-backed caches, created by `make dirs` / setup, so rebuilds are
-      # fast and the module cache survives container replacement.
+      - .:/src
+      # Host-backed caches, so rebuilds are fast and the module cache
+      # survives container replacement.
       - ./.cache/go-build:/tmp/gocache
       - ./.cache/go-mod:/tmp/gomod
     environment:
@@ -152,7 +81,8 @@ services:
       GOMODCACHE: /tmp/gomod
       GOPATH: /tmp/gopath
       GOTOOLCHAIN: local
-    # Match your host UID/GID so files written into ./server stay yours.
+    # Match your host UID/GID so files written into ./ stay yours.
+    # Check with: id -u && id -g
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     tty: true
     stdin_open: true
@@ -164,29 +94,26 @@ services:
     # https://jira.mongodb.org/browse/SERVER-121912
     image: mongo:9.0
     container_name: cyberguard-mongodb
-    env_file:
-      - path: .env
-        required: false
+    restart: unless-stopped
     environment:
       MONGO_INITDB_DATABASE: ${MONGODB_DATABASE:-cyberguard}
     volumes:
       - mongo-data:/data/db
-    # The default container limit is 1024 open files, and mongod runs out at
-    # that under an integration-test run that opens a client per test. It then
-    # logs "Too many open files" and refuses every new connection, which looks
-    # exactly like a database outage.
+    # The default container limit is 1024 open files; mongod runs out at that
+    # under an integration-test run that opens a client per test and then
+    # looks exactly like a database outage.
     ulimits:
       nofile:
         soft: 65536
         hard: 65536
-    # No published ports: reachable as "mongodb:27017" inside the network only.
+    # No published ports: reachable as "mongodb:27017" from the API container
+    # on the compose network only.
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 20s
-    restart: unless-stopped
 
 volumes:
   mongo-data:

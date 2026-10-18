@@ -1,492 +1,370 @@
-# CyberGuard AI
+# CyberGuard AI — backend
 
-Backend service for a browser extension that checks URLs against the
-Hybrid Analysis API v2 and publishes a versioned `declarativeNetRequest`
-ruleset.
+A small Go REST API that checks a URL against Hybrid Analysis's quick-scan
+endpoint and reuses the stored result in MongoDB. Two endpoints, one
+collection, no queues, no workers. Everything runs in one process.
 
-The architecture review and technical documentation live in [`docs/`](docs/).
-Start with [`docs/architecture.md`](docs/architecture.md).
+```
+browser / curl
+     │  POST /api/v1/check-url                     (synchronous)
+     ▼
+┌──────────────┐  MongoDB first:                  ┌────────────────────┐
+│  cmd/api     │  cached+fresh ⇒ answer, 0 calls  │ Hybrid Analysis v2 │
+│  (Go 1.27)   │  pending ⇒ reuse provider id     │                    │
+│              │ ─── POST /quick-scan/url ──────▶ │  (only the two     │
+│              │ ◀────────────────────── JSON ──  │   quick-scan       │
+│              │ ─── GET /quick-scan/{id} ──────▶ │   endpoints)       │
+│              │ ◀────────────────────── JSON ──  └────────────────────┘
+└──────┬───────┘
+       │ normalized verdict stored atomically (one record per canonical URL)
+       ▼
+   MongoDB ── one collection: url_submissions
+       ▲
+       │  GET /api/v1/get-all  (page/limit, newest first)
+```
 
-The original project brief is
-[`docs/architecture/CYBERGUARD_PROJECT.md`](docs/architecture/CYBERGUARD_PROJECT.md);
-its backend-language and verdict-vocabulary statements are superseded — see
-[`docs/architecture.md` §7](docs/architecture.md#7-conflicts-found-during-review).
-This README covers only how to run the service.
+## Endpoints
 
-## Documentation
+| Method | Path                 | Purpose                                                       | Success   |
+| ------ | -------------------- | ------------------------------------------------------------- | --------- |
+| POST   | `/api/v1/check-url`  | Check a URL: cache first, provider only when needed           | `200` or `202` |
+| GET    | `/api/v1/get-all`    | List stored assessments, newest stored first                  | `200`     |
+| GET    | `/health/live`       | Liveness: is the process serving                              | `200`     |
+| GET    | `/health/ready`      | Readiness: process **and** MongoDB reachable                   | `200`     |
+| GET    | `/openapi.yaml`      | The OpenAPI 3 contract (byte-identical commit)                | `200`     |
+| GET    | `/docs/`             | Swagger UI rendering that contract                            | `200`     |
 
-| Document | Contents |
-|---|---|
-| [`architecture.md`](docs/architecture.md) | Overview, diagrams, lifecycle, failure behaviour, conflicts found |
-| [`api-contract.md`](docs/api-contract.md) | Endpoints, schemas, status codes, errors, rate limits |
-| [`data-model.md`](docs/data-model.md) | Collections, indexes, TTL, dedup, retention |
-| [`module-map.md`](docs/module-map.md) | Package layout, dependency direction, enforced boundaries |
-| [`security-and-privacy.md`](docs/security-and-privacy.md) | Threat model, ruleset policy, redaction, MV3 limits |
-| [`hybrid-analysis-integration.md`](docs/hybrid-analysis-integration.md) | Adapter design and the **unverified** provider checklist |
-| [`docker-development.md`](docs/docker-development.md) | Compose topology, health checks, local workflow |
-| [`testing-strategy.md`](docs/testing-strategy.md) | Test layers, fakes, acceptance criteria |
-| [`implementation-plan.md`](docs/implementation-plan.md) | Phases, risks, open questions |
-| [`decisions/`](docs/decisions/) | Architecture decision records |
+Swagger UI: <http://localhost:8080/docs/> — fully vendor-embedded, no CDN, no
+external requests. Raw contract: <http://localhost:8080/openapi.yaml>.
 
-> **Status: end-to-end scan workflow implemented.** `POST /api/v1/check-url`
-> accepts a URL, deduplicates it, encrypts it and leaves it claimable; the scan
-> runner claims it, submits it to the provider, polls, normalises the result and
-> caches the verdict; `GET /api/v1/get-url/{scanId}` serves the outcome.
-> Verified end to end against live MongoDB with a **mock** provider.
->
-> The runner is goroutines inside the API process and the `scans` collection is
-> the queue, so the deployment is **one application process plus MongoDB**. There
-> is no separate worker binary and no Redis. `POST /api/v1/check-url` still
-> returns **202** and never waits for an analysis to finish.
->
-> **The Hybrid Analysis adapter has never been called against the live API.**
-> Its contract was verified against the published OpenAPI document and every
-> test uses a mock, but nine specification gaps remain open. See [Status](#status).
+Health shapes: `/health/live` → `{"status":"ok"}`. `/health/ready` →
+`{"status":"ready","checks":{"mongodb":"ok","provider":"configured"}}`, or
+`503` with `"status":"not_ready"` when MongoDB is unreachable, and
+`checks.provider` spelling out `HYBRID_ANALYSIS_API_KEY is not set` when the
+key is absent (readiness marks it, but the process still serves).
 
-## Requirements
+## How check-url works
 
-Docker with Compose v2. Nothing else — Go runs inside containers, so no
-toolchain install is needed on the host.
+1. **Canonicalize once.** The URL is trimmed, scheme/host are lowercased,
+   default ports (`:80`/`:443`) and fragments are dropped; path and query stay
+   byte-for-byte intact, so signed links keep validating. The SHA-256 of the
+   canonical form is the cache key — lookups, stored records and the provider
+   submission all use the same canonical URL.
+2. **MongoDB first.**
+   - A **completed** assessment inside the cache lifetime (`ASSESSMENT_TTL`,
+     default 24h) is returned immediately (HTTP 200). The provider is not
+     contacted at all.
+   - A **pending** record (provider accepted, `finished: false`) reuses its
+     existing provider id and polls the documented retrieval endpoint instead
+     of submitting the URL again. Pending records older than the TTL are
+     submitted once more, in place (never a second record).
+3. **Provider, only when needed.** `POST /quick-scan/url`, exactly once per
+   request, never retried (the endpoint has no idempotency token).
+4. **Retrieve the final result.** When the submission answers
+   `finished: false`, the documented `GET /quick-scan/{id}` is polled — first
+   immediately, then every `HYBRID_ANALYSIS_POLL_INTERVAL` — until the provider
+   reports `finished: true`, the request budget (based on
+   `HYBRID_ANALYSIS_TIMEOUT`) runs out, or the provider fails.
+5. **Persist honestly, at most forward.** A finished result is normalized
+   (below) and saved with a guarded update so a completed assessment can never
+   be overwritten by pending data. Unknown concurrent requests for the same
+   canonical URL converge on one record inside the process and via the
+   unique `uniq_url_hash` index across processes.
+
+Responses:
+
+- **HTTP 200** — `"URL analysis completed"`: a completed assessment is in the
+  response, served from cache or obtained during this request.
+- **HTTP 202** — `"Analysis is still in progress"`: the provider has not
+  finished within the budget. `data.status` is `pending`, `data.verdict` is
+  `null`; the next call with the same URL resumes the existing assessment.
+
+## Verdict normalization
+
+The provider's quick scan has no aggregate verdict field — it reports
+per-scanner statuses (`scanners_v2`, plus the deprecated `scanners` array
+classified by the same rules). A verdict is computed only from a
+`finished: true` response, by this ladder, never guessed and never hardcoded:
+
+| Scanner status text (case-insensitive)            | Evidence      |
+| ------------------------------------------------- | ------------- |
+| contains `malicious`                              | malicious     |
+| contains `suspicious`                             | suspicious    |
+| `no specific threat` / `no threat` / `clean` / `whitelist` | benign |
+| `error`, or a non-null `errorMessage` on an unclassified entry | errored |
+| anything else (`no-classification`, `in-queue`, empty, unrecognized) | unresolved |
+| `null` or unusable entry (scanner never produced data) | missing — **not** benign |
+
+1. any malicious evidence → `malicious`
+2. else any suspicious evidence → `suspicious` (worst evidence wins over clean)
+3. else benign evidence with no unresolved and no errored scanners left →
+   `no_threat_detected`
+4. else unresolved or errored scanners remain → `inconclusive`
+5. else nothing usable evaluated (every entry missing) → `unknown`
+
+`verdict` is `null` while `status` is `pending`. Provider errors are never
+read as verdicts; a SHA-256 digest with no scanner evidence proves nothing;
+`scannersV2` itself is verbatim passthrough of provider data.
 
 ## Quick start
 
+### Docker (recommended — no host Go needed)
+
 ```sh
-docker compose up -d --build
+cp .env.example .env         # then put your Hybrid Analysis key in .env
+docker compose up -d --build # starts MongoDB + the API on :8080
 ```
 
-That is the whole thing. Docker Compose sets `ANALYSIS_PROVIDER=mock`, so **no
-Hybrid Analysis account, no API key and no external request is involved**. The
-API is on <http://localhost:8080>.
-
-> The *binary's* own default is `hybrid-analysis`, which requires an API key and
-> fails fast without one. That is deliberate — a server should not silently
-> pretend to be analysing URLs when it is not — so a binary run outside Compose
-> needs `ANALYSIS_PROVIDER=mock` set explicitly.
+### Host (needs Go 1.27 and a running MongoDB)
 
 ```sh
-curl localhost:8080/health/live          # {"status":"ok"}
-curl localhost:8080/health/ready         # {"status":"ready",...}
+go run ./cmd/api             # reads .env in the working directory
 ```
 
-### API documentation
-
-The backend serves its own documentation. Both endpoints are on by default and
-need no secret:
-
-| URL | What it is |
-|---|---|
-| <http://localhost:8080/docs/> | **Swagger UI** — interactive, with *Try it out* on every operation |
-| <http://localhost:8080/openapi.yaml> | The OpenAPI 3.1 contract, as raw YAML |
-
-Swagger UI is **vendored into the binary** at a pinned version
-(`server/internal/httpapi/docs/assets/`, Apache-2.0). No CDN is used at runtime,
-so the page renders with no internet access — including inside an air-gapped
-deployment, which is when an operator is most likely to want it. The page prints
-the pinned release it was built with, so you can tell what you are reading
-without leaving the browser.
-
-To switch it off — the API is unaffected either way:
+MongoDB on the host:
 
 ```sh
-# .env
-API_DOCS_ENABLED=false
+docker run -d --name cyberguard-mongodb -p 27017:27017 mongo:9.0
 ```
 
+The server starts without MongoDB running by **failing** at launch — it pings
+the database through the connection, so a wrong `MONGODB_URI` is a startup
+error, not a runtime mystery.
+
+## Configuration (`.env`)
+
+Every variable is optional; sensible defaults fit `docker compose`.
+
+| Variable                         | Default                                  | Meaning                                                                                        |
+| -------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `APP_PORT`                       | `8080`                                   | HTTP port (host port under Compose; the container always listens on 8080)                       |
+| `MONGODB_URI`                    | `mongodb://localhost:27017`              | MongoDB connection string (Compose overrides to `mongodb://mongodb:27017`)                      |
+| `MONGODB_DATABASE`               | `cyberguard`                             | Database name (one collection: `url_submissions`)                                               |
+| `HYBRID_ANALYSIS_BASE_URL`       | `https://hybrid-analysis.com/api/v2`     | Provider base URL — see the "no www" note under Limitations                                     |
+| `HYBRID_ANALYSIS_API_KEY`        | *(empty)*                                | Hybrid Analysis API key. Without it check-url answers `503 provider_not_configured`             |
+| `HYBRID_ANALYSIS_TIMEOUT`        | `30s`                                    | Per-request provider budget (max `5m`); also bounds the whole check-url wait for a final result |
+| `HYBRID_ANALYSIS_SCAN_TYPE`      | `all`                                    | Optional: documented `scan_type` value, validated at startup against the provider's enum         |
+| `HYBRID_ANALYSIS_POLL_INTERVAL`  | `1s`                                     | Pause between result retrievals while one request waits (`> 0`, at most `1m`)                    |
+| `ASSESSMENT_TTL`                 | `24h`                                    | How long a completed assessment stays reusable as a cached result (`> 0`, at most `336h`)         |
+| `CORS_ALLOWED_ORIGINS`           | `http://localhost:3000,http://localhost:5173` | Exact allowed origins, comma separated. `*` is rejected at startup                          |
+
+The key is read from the environment (or `.env`) and used **only** in the
+provider request header. It is never logged, never stored, and never appears
+in any API response.
+
+## Using the API
+
+### Check a URL — `curl`
+
 ```sh
-# or per run
-API_DOCS_ENABLED=false docker compose up -d backend
-```
-
-#### Testing an endpoint with Try it out
-
-With the stack running:
-
-1. Open <http://localhost:8080/docs/>.
-2. Expand `POST /api/v1/check-url`.
-3. Leave the server on `http://127.0.0.1:8080` (the default) and click
-   **Try it out**.
-4. Edit the `url` value — `https://example.test/login` works, since `.test`
-   never resolves and the request stays inside the mock provider.
-5. Click **Execute**. You get `202` with a `scan_id` and a `status_url`, and
-   **no verdict**: nothing has been analysed yet.
-6. Expand `GET /api/v1/get-url/{scanId}`, paste the `scan_id` into `scanId`,
-   click **Try it out** then **Execute**. Repeat every couple of seconds until
-   `status` is `completed`, `failed` or `timed_out`.
-7. If you lost the `scan_id`, `POST /api/v1/get-url` takes `{"url": "..."}` and
-   returns the same result for the URL's most recent scan. It is a POST because
-   a URL in a path would land in every access log between here and the server.
-8. `GET /api/v1/get-all` returns the browser protection ruleset.
-
-The same two calls with curl:
-
-```sh
-# 1. Submit. 202, queued, no verdict.
-SCAN=$(curl -sS -X POST localhost:8080/api/v1/check-url \
+curl -sS -X POST http://localhost:8080/api/v1/check-url \
   -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.test/login"}' | sed -E 's/.*"scan_id":"([^"]+)".*/\1/')
-
-# 2. Poll. The same poll by URL, for a client that lost the scan ID.
-curl -sS "localhost:8080/api/v1/get-url/$SCAN"
-curl -sS -X POST localhost:8080/api/v1/get-url \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.test/login"}'    # 404 if never scanned
-
-# 3. The ruleset.
-curl -sS localhost:8080/api/v1/get-all
+  -d '{"url":"https://example.com"}'
 ```
 
-#### Limitations of Try it out
+`200` — a completed assessment is available (from cache or finished in this
+request); `202` — still pending:
 
-- **The server list is fixed by the contract.** Swagger UI defaults to the
-  first entry of `servers` in `openapi.yaml` and offers the rest in a dropdown.
-  Behind a proxy or on another port, add your origin to that list and redeploy —
-  the dropdown cannot discover deployments on its own.
-- **CORS still applies.** Picking a server on a different origin than the one
-  serving the page gets the request blocked by the browser before it is sent.
-  The same-origin local default always works.
-- **It issues one request per *Execute*.** Nothing polls for you; for
-  `check-url` you follow `status_url` yourself.
-- **No authentication exists**, so there is nothing to supply. The UI is
-  configured not to persist credentials.
+```json
+{
+  "success": true,
+  "message": "URL analysis completed",
+  "data": {
+    "id": "68f2b4c1a3e6f9001234abcd",
+    "url": "https://example.com",
+    "provider": "hybrid-analysis",
+    "providerId": "120-abcdef123456…",
+    "sha256": "…64 hex…",
+    "scanType": "all",
+    "status": "completed",
+    "finished": true,
+    "scannersV2": { "…provider passthrough…": {} },
+    "reports": ["…"],
+    "verdict": "no_threat_detected",
+    "createdAt": "2026-10-17T12:34:56.789Z",
+    "updatedAt": "2026-10-17T12:34:56.789Z"
+  }
+}
+```
 
-The contract is validated in CI by Go tests in `internal/httpapi`: it parses,
-every documented path matches a registered route and vice versa, every `$ref`
-resolves, the `Verdict` and `ScanStatus` enums equal the Go constants, and no
-credential appears in it. A full OpenAPI 3.1 schema check needs a linter and is
-run by hand:
+- `id` is the MongoDB document ID; `providerId` is the provider's own ID and
+  the handle a pending resume polls.
+- `status` is `completed` only when the provider reported `finished: true`;
+  otherwise `pending` (message `"Analysis is still in progress"`, HTTP 202).
+  Records written by older versions read `submitted` until they are touched;
+  they behave exactly like `pending`.
+- `verdict` is `null` while pending, otherwise one of the documented values
+  above (`malicious`, `suspicious`, `no_threat_detected`, `inconclusive`,
+  `unknown`), derived only from a `finished: true` provider response.
+
+Calling the same URL twice costs at most one provider submission: the second
+call is answered from MongoDB until the cached assessment expires
+(`ASSESSMENT_TTL`), after which it is assessed again — in place.
+
+### List assessments — `curl`
 
 ```sh
-npx @redocly/cli lint server/openapi.yaml
+curl -sS 'http://localhost:8080/api/v1/get-all?page=1&limit=20'
 ```
 
-### Two secrets are required
+```json
+{
+  "success": true,
+  "data": [ { "…assessment as above…" } ],
+  "pagination": { "page": 1, "limit": 20, "total": 1, "totalPages": 1 }
+}
+```
 
-If you are starting from an empty `.env`:
+`page` starts at 1 (max 1,000,000; out-of-range is `400`), `limit` defaults to
+20 and caps at 100. Unknown or malformed parameters are `400` with the common
+error shape — nothing is silently clamped. An empty result set returns
+`data: []`, never `null`. Records are sorted by their last update time, so a
+record that just obtained its final result sorts near the top.
+
+### From JavaScript
+
+```js
+async function checkURL(url) {
+  const res = await fetch("/api/v1/check-url", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url }),
+  });
+  const body = await res.json();
+  if (!body.success) throw new Error(`${body.error.code}: ${body.message}`);
+  return body.data; // { id, status, verdict, scannersV2, ... }
+  // status === "pending" ⇒ try again later; the same call resumes it.
+}
+
+async function listSubmissions(page = 1, limit = 20) {
+  const res = await fetch(`/api/v1/get-all?page=${page}&limit=${limit}`);
+  const body = await res.json();
+  if (!body.success) throw new Error(`${body.error.code}: ${body.message}`);
+  return body; // { data: [...], pagination: {...} }
+}
+```
+
+CORS is enforced strictly: only origins in `CORS_ALLOWED_ORIGINS` receive
+`Access-Control-Allow-Origin`, OPTIONS preflight is answered, `*` is
+explicitly impossible.
+
+### Errors
+
+Every failure is one shape:
+
+```json
+{
+  "success": false,
+  "message": "…safe, client-facing reason…",
+  "error": { "code": "invalid_request", "status": 400 }
+}
+```
+
+| Code                      | HTTP | When                                                                 |
+| ------------------------- | ---- | -------------------------------------------------------------------- |
+| `invalid_request`          | 400  | Bad JSON, bad `page`/`limit` parameters                              |
+| `validation_error`         | 422  | URL parsed but rejected (empty, too long, unsupported scheme, no host, control chars) |
+| `provider_not_configured`  | 503  | No API key configured                                                |
+| `provider_auth_failed`     | 502  | Provider rejected the configured API key                             |
+| `provider_rate_limited`    | 429  | Provider throttled the request (`Retry-After` header when known)     |
+| `provider_timeout`         | 504  | Provider exceeded `HYBRID_ANALYSIS_TIMEOUT` (never auto-retried)     |
+| `provider_rejected`        | 502  | Provider refused the request (submission or unknown scan id)         |
+| `provider_unavailable`     | 502  | Provider unreachable (network error)                                 |
+| `provider_bad_response`    | 502  | Provider answered unparseable JSON                                   |
+| `request_in_progress`      | 503  | An equivalent request for this URL is being analysed; retry shortly  |
+| `store_unavailable`        | 503  | MongoDB insert/read failed                                           |
+| `method_not_allowed`       | 405  | Wrong verb on an existing path                                       |
+| `not_found`                | 404  | Unknown path                                                         |
+
+Provider error details are logged server-side (with request ID and cause);
+the response body only ever carries the safe message and the code above.
+Provider errors never fabricate a verdict, and a pending record simply stays
+pending through them.
+
+## Development
+
+The Go toolchain runs inside Docker (the host needs none):
 
 ```sh
-cp .env.example .env
-openssl rand -hex 32    # -> URL_FINGERPRINT_HMAC_KEY
-openssl rand -hex 32    # -> URL_ENCRYPTION_KEY   (a DIFFERENT one)
+docker compose run --rm go gofmt -l cmd internal docs        # formatting
+docker compose run --rm go go vet ./...                     # static analysis
+docker compose run --rm go go build ./...                   # compiles everything
+docker compose run --rm go go test -count=1 ./...           # unit tests (httptest only)
+docker compose run --rm go go mod tidy                      # dependency hygiene
+docker compose run --rm go go test -race ./...              # race detector (needs gcc: debian image)
 ```
 
-Both are 64 hexadecimal characters. They must differ: rotating the fingerprint
-key invalidates the whole cache, while rotating the encryption key only affects
-jobs in flight.
-
-Without them the service still starts — so you can read `/health/ready` and be
-*told* what is wrong — but it reports **not ready** and refuses URL submissions,
-rather than storing raw URLs unencrypted.
-
-`URL_ENCRYPTION_KEY` is generated once and kept. Do not regenerate it on every
-start: scans that have not been submitted yet could no longer be decrypted.
-
-### Mock mode (the default)
-
-`ANALYSIS_PROVIDER=mock` analyses URLs **inside the API process**, on the scan
-runner's own goroutines. Nothing leaves your machine, results are deterministic
-(the same URL always gives the same verdict), and no API key is needed.
-
-The verdict depends on a keyword in the URL, so every branch can be tried:
-
-| URL contains | Result |
-|---|---|
-| `/malicious` | `verdict: malicious` |
-| `/suspicious` | `verdict: suspicious` |
-| `/no-threat` or `/clean` | `verdict: no_threat_detected` |
-| `/error` | scan `failed`, error `provider_analysis_failed`, **no verdict** |
-| `/slow` | never finishes — the scan ends `timed_out` |
-| anything else | `verdict: no_threat_detected` |
-
-There is **no silent fallback**. Selecting `hybrid-analysis` without an API key
-is a startup error, not a quiet switch to the mock — otherwise the real
-integration would rot while its tests still passed.
-
-### Schema migration
-
-`docker compose up` runs a one-shot `migrate` service first, and the API
-waits for it to succeed. It creates the indexes the system depends on —
-most importantly the partial unique index that makes "one provider submission
-per URL" actually true, and `by_claimable` on `scans`, which is what makes a
-queued scan findable by the runner.
-
-Run it by hand any time:
+One integration test needs a real MongoDB and is skipped otherwise:
 
 ```sh
-docker compose run --rm migrate            # create/refresh indexes
-docker compose run --rm migrate -verify    # check without changing anything
+docker compose run --rm go \
+  go test -count=1 -run TestStore ./internal/mongodb      # needs MONGO_TEST_URI
+# or, inside the compose network:
+docker compose run --rm \
+  -e MONGO_TEST_URI=mongodb://mongodb:27017 \
+  go go test -count=1 -run TestStore ./internal/mongodb
 ```
 
-### Exercising it end to end
+No test ever contacts Hybrid Analysis — provider behaviour is faked with
+`httptest` servers, including success, auth failure, rate-limit, slow
+response and malformed body cases.
+
+The container listens on 8080; `APP_PORT` selects the published host port but
+not the container's (docker-compose.yml pins the in-container value to 8080):
 
 ```sh
-# 1. Submit a URL. Returns 202 and a scan id — no verdict, nothing analysed yet.
-curl -sS -X POST localhost:8080/api/v1/check-url \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.test/login"}'
-# {"scan_id":"scan_3f2a...","status":"queued","cached":false,
-#  "status_url":"/api/v1/get-url/scan_3f2a..."}
-
-# 2. Poll. Repeat every 2s until status is completed, failed or timed_out.
-curl -sS localhost:8080/api/v1/get-url/scan_3f2a...
-# {"scan_id":"scan_3f2a...","status":"completed","verdict":"malicious",
-#  "provider":"hybrid-analysis","evidence":[...],"analyzed_at":...,"expires_at":...}
-
-# 3. Submit the same URL again. Served from cache, no provider call, 200.
-curl -sS -X POST localhost:8080/api/v1/check-url \
-  -H 'Content-Type: application/json' \
-  -d '{"url":"https://example.test/login"}'
-# {"scan_id":"scan_3f2a...","status":"completed","cached":true,"verdict":"malicious",...}
+APP_PORT=9000 docker compose up -d --build
+curl -sS http://localhost:9000/health/ready
 ```
-
-An in-flight scan has **no `verdict` field at all**. That is the honest
-representation of "not known yet"; it is not an empty verdict and not a safe one.
-
-In Postman: `POST {{base_url}}/api/v1/check-url` with a raw JSON body
-(`Body → raw → JSON`) of `{"url": "https://example.test/login"}` and
-`Content-Type: application/json`; then `GET {{base_url}}/api/v1/get-url/{scan_id}`,
-using the `scan_id` from the first response as the path variable.
-
-### What the responses look like when things go wrong
-
-```sh
-# 422 — the URL failed validation
-curl -sS -X POST localhost:8080/api/v1/check-url \
-  -H 'Content-Type: application/json' -d '{"url":"javascript:alert(1)"}'
-
-# 422 — the target is refused before anything is stored
-curl -sS -X POST localhost:8080/api/v1/check-url \
-  -H 'Content-Type: application/json' -d '{"url":"http://192.168.1.1/admin"}'
-
-# 429 — the per-fingerprint submission budget for this hour is spent
-curl -si -X POST localhost:8080/api/v1/check-url \
-  -H 'Content-Type: application/json' -d '{"url":"https://example.test/x"}'
-# Retry-After: 3600
-# X-RateLimit-Limit: 10
-# X-RateLimit-Remaining: 0
-# X-RateLimit-Reset: 1763000000
-
-# 503 — a required secret or dependency is missing
-curl -sS localhost:8080/health/ready
-```
-
-Every error body is an RFC 9457 problem detail with a stable `code` field.
-Branch on `code`, never on `detail`.
-
-## Commands
-
-| Task | Command |
-|---|---|
-| Start / stop | `docker compose up -d --build` · `docker compose down` |
-| Re-run the schema migration | `docker compose run --rm migrate` |
-| Check the schema is current | `docker compose run --rm migrate -verify` |
-| Stop and wipe data | `docker compose down -v` |
-| Follow logs | `docker compose logs -f backend` |
-| Run tests | `docker compose run --rm go go test ./...` |
-| Race detector | `docker compose run --rm go sh -c 'apk add -q build-base && CGO_ENABLED=1 go test -race ./...'` |
-| Integration tests | `docker compose run --rm go go test -tags integration ./...` |
-| Vet | `docker compose run --rm go go vet ./...` |
-| Vet (integration) | `docker compose run --rm go go vet -tags integration ./...` |
-| Format | `docker compose run --rm go gofmt -w .` |
-| Coverage | `docker compose run --rm go go test -coverpkg=./... -coverprofile=/src/coverage.out ./...` |
-| Build a binary | `docker compose run --rm go go build -o bin/api ./cmd/api` |
-| Check the version stamp | `docker compose exec backend cyberguard-api -version` |
-
-Integration tests need MongoDB running, and work **with the application
-running too** — they use their own MongoDB database, so they never disturb a
-live deployment:
-
-```sh
-docker compose up -d mongodb
-docker compose run --rm go go test -tags integration ./...
-```
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `MONGODB_URI` | `mongodb://mongodb:27017` | datastore the tests connect to |
-| `MONGODB_DATABASE` | `cyberguard_integration` | database the tests create and drop |
-
-Rate-limit tests are **not** in that set: the counters are in-process, so they
-are ordinary unit tests and need no datastore at all.
-
-## Services
-
-| Service | Image | Published | Purpose |
-|---|---|---|---|
-| `backend` | built from `server/` | `8080` | JSON API **and** the scan runner |
-| `migrate` | same image, different entrypoint | none | one-shot: creates indexes, then exits |
-| `mongodb` | `mongo:9.0` | none | authoritative store **and work queue** |
-| `go` | `golang:1.27-alpine` | none | dev toolchain for build/test |
-
-MongoDB publishes **no host ports**; containers reach it as `mongodb:27017` on
-the Compose network, per §11.11 of the architecture doc. Publish it yourself
-only if you need a local client. It is the only datastore, so `docker compose up`
-starts two long-running services.
-
-MongoDB is pinned to 9.x on purpose: 8.0 refuses to start on Linux kernel
-6.19+ ([SERVER-121912](https://jira.mongodb.org/browse/SERVER-121912)), which
-Ubuntu 26.04 runs.
-
-## Configuration
-
-All settings come from the environment; see [`.env.example`](.env.example) for
-the full list. The ones that matter most:
-
-- `URL_FINGERPRINT_HMAC_KEY` — **required.** Without it the service reports
-  not-ready and rejects submissions, because exact-URL cache lookups cannot
-  work. Changing it invalidates every stored fingerprint.
-- `HYBRID_ANALYSIS_API_KEY` — optional. Without it remote submission stays
-  disabled and readiness reports it as a degraded sub-check, not a failure.
-- `MONGODB_URI` / `MONGODB_DATABASE` / `MONGODB_CONNECT_TIMEOUT` /
-  `MONGODB_PING_TIMEOUT`
-- `WORKER_CLAIM_POLL_GAP` (default `250ms`) — how hard an idle runner queries
-  MongoDB for work. MongoDB has no blocking claim primitive, so an idle consumer
-  polls; this bounds how fast.
-- `CLAIM_LEASE_HEADROOM` (default `30s`) — the claim lease is **derived**, not
-  set directly: `WORKER_POLL_DEADLINE + WORKER_POLL_INTERVAL + CLAIM_LEASE_HEADROOM`.
-  The lease must outlive the longest possible unit of work, or a second claim
-  could land on a scan whose provider analysis is still running — and on the
-  submission path that means submitting the URL twice. A headroom of `<= 0` is
-  rejected at config load rather than accepted and left to fail in production.
-- `HEALTH_CHECK_TIMEOUT` — bounds each readiness probe.
-- `API_DOCS_ENABLED` — serves Swagger UI at `/docs/` and the contract at
-  `/openapi.yaml`. Defaults to `true`; no secret is involved. Setting it to
-  `false` removes both endpoints and leaves the API untouched.
-
-`.env` is gitignored. Never commit real keys. Secrets are read and trimmed, so a
-value pasted from a secret manager with a trailing newline cannot silently
-become a different key on one replica than on another.
 
 ## Layout
 
 ```
-server/
-├── cmd/
-│   ├── api/                      # HTTP server entrypoint + the scan runner
-│   └── migrate/                  # one-shot index creation
-├── internal/
-│   ├── app/                      # shared datastore wiring
-│   ├── config/                   # env loading and validation
-│   ├── health/                   # readiness probes (Check interface + Checker)
-│   ├── httpapi/                  # routing, middleware, RFC 9457 handlers
-│   │   └── docs/                 # Swagger UI; vendored assets + embedded page
-│   ├── logging/                  # slog setup (JSON to stderr)
-│   ├── platform/
-│   │   ├── mongostore/           # MongoDB repositories + indexes + transient URL crypto
-│   │   │                        # + the lease-based claim query
-│   │   └── mongoqueue/           # scans collection adapted to the delivery interface
-│   ├── ratelimit/                # in-process fixed-window counters
-│   ├── providers/                # provider contract (moves to scans in Phase 4)
-│   │   ├── hybridanalysis/       # real adapter — the only HA-aware package
-│   │   └── mock/                 # deterministic fake provider for tests
-│   ├── urlintel/                 # URL validation, canonicalisation, HMAC fingerprints, PSL host intelligence
-│   └── verdicts/                 # CyberGuard verdict vocabulary
-├── openapi.yaml                  # authoritative API contract
-├── spec.go                       # embeds openapi.yaml so /openapi.yaml serves it
-├── .redocly.yaml                 # optional hand-run OpenAPI lint config
-├── Dockerfile                    # multi-stage: golang builder → alpine runtime
-└── go.mod
+cmd/api/               the one binary: config, wiring, graceful shutdown
+internal/config/       environment + .env parsing, validation, CORS
+internal/handlers/     HTTP layer: routing, envelopes, errors, 200/202, Swagger UI
+internal/services/     check-url orchestration, verdict normalization, error mapping
+internal/hybridanalysis/  the provider client (POST /quick-scan/url + GET /quick-scan/{id})
+internal/mongodb/      connection and the store: cache lookups, guarded writes, listing
+internal/models/       the document/response shapes (single source of truth)
+internal/docs/assets/  vendored Swagger UI
+docs/openapi.yaml      the contract served at /openapi.yaml
 ```
 
-The module has two **runtime** third-party dependencies — the official
-MongoDB Go driver and `golang.org/x/net` for the Public Suffix List — and one
-**test-only** dependency, `gopkg.in/yaml.v3`, used by
-`internal/httpapi/openapi_test.go` to parse and check the contract. Nothing
-reaches the request path that is not there for the service itself. `go-redis`
-was removed with the worker; the lease-based claim lives in MongoDB, so the
-driver is now the only datastore dependency.
+## Limitations
 
-`openapi.yaml` lives inside the module so that
-`internal/httpapi/openapi_test.go` can assert the router and the contract have
-not drifted apart, in any environment.
+- **No `www` in the base URL.** The v2 specification declares
+  `https://hybrid-analysis.com/api/v2`; the `www` host answers `301` to it,
+  and a Go client does not replay a POST body across that redirect, so `www`
+  would break every scan. Keep the default.
+- **Quick scan surface only.** The provider's quick scan is not the full
+  sandbox analysis. Final results come from the documented retrieval endpoint
+  (`GET /quick-scan/{id}`) polled inside one request; nothing else is called —
+  no quota probes, no search, no feeds.
+- **One request, one budget.** A pending analysis is answered `202` when the
+  request budget runs out; it stays pending (and reusable) until a later call
+  finishes it or it ages past `ASSESSMENT_TTL` and is re-submitted in place.
+- **Provider retention is not ours.** If the provider stops knowing a pending
+  quick scan id, retrieval reports `provider_rejected` and the record stays
+  pending until its TTL re-submission. The provider's own retention windows
+  are outside this service's control.
+- **Provider failures are not stored.** A failed request persists nothing
+  false; an existing pending record stays pending, a completed one is
+  untouched.
+- **Single-process coordination.** Equivalent requests are collapsed inside
+  the API process; across replicas the unique index keeps the store
+  consistent (losers adopt the winner's record), but two replicas may both
+  submit once on a cold URL. Never auto-retried.
+- **No authentication or rate limiting on the API itself.** CORS restricts
+  *which pages* can call, not *how often*. Behind a public load balancer add
+  auth throttling before exposing check-url.
+- **Submissions are never retried.** A failed provider call is reported back
+  as-is; the caller decides whether to try again (each attempt may consume
+  provider quota). Result retrieval differs — it is a read, retried only by
+  the poll loop inside one request.
+- **Licensing.** Automated submission requires Hybrid Analysis usage approval
+  before commercial release — confirm your account's terms first.
 
-Known deviations, tracked in
-[`docs/implementation-plan.md`](docs/implementation-plan.md#outstanding-deviations):
-
-- **The module path `cyberguard/server` is a placeholder.** There is no Git
-  remote and no commit, so it cannot be derived without guessing
-  ([ADR 0016](docs/decisions/0016-go-module-path.md), deviation D1). This
-  **blocks Phase 4**.
-
-## Status
-
-Implemented:
-
-- URL validation — http/https only, rejects embedded credentials, overlong
-  input, control characters, missing host
-- Deterministic canonicalisation (path and query case preserved, fragment
-  dropped, empty path normalised to `/`)
-- HMAC-SHA-256 URL fingerprinting
-- **Host intelligence**: hostname normalisation (IDNA/punycode, case, trailing
-  dot) kept separate from registrable-domain extraction via the Public Suffix
-  List. A public suffix is never returned as a domain; IPs, `localhost` and
-  unresolvable hosts are refused rather than guessed at
-- Environment-based configuration with validation of every malformed value
-- Structured `log/slog` JSON logging to stderr
-- HTTP server with request-ID propagation, access logging, panic recovery,
-  bounded body reads and graceful shutdown
-- `GET /health/live` (dependency-free) and `GET /health/ready` (config +
-  MongoDB + provider probes, plus the fingerprint/encryption key checks)
-- MongoDB connection management with bounded timeouts, verified by ping, and
-  idempotent disconnect
-- **MongoDB persistence (Phase 3)**: `scans`, `assessments` and `transient_urls`
-  repositories; scan lifecycle and status transitions; provider job ID and
-  submission ID retention; verdict cache with expiry; encrypted transient URL
-  storage (AES-256-GCM, AAD-bound)
-- **Deduplication at the database level**: a partial unique index makes N
-  concurrent requests for one URL produce exactly one provider submission
-- **Lease-based claiming on MongoDB** — a single atomic `FindOneAndUpdate`
-  stamps `lease_owner`/`lease_expires_at` on a claimable scan, so several
-  replicas compete safely for the same work with nothing to coordinate
-- **RFC 9457** problem-detail error responses
-- **OpenAPI 3.1** contract with a CI-enforced drift check against the router
-- **End-to-end scan workflow** — submit, deduplicate, encrypt, queue, submit to
-  the provider, poll, normalise, cache, serve
-- **Crash recovery** — the scan document *is* the dispatch ledger, so a lost or
-  failed process delays work rather than losing it: the lease lapses and the
-  next claim picks the scan up
-- **Abuse controls** — in-process fixed-window per-client and per-fingerprint
-  limits, with the same `X-RateLimit-*` headers and the same fail-closed
-  contract as before
-- **Target gate** — loopback, private, link-local and reserved hosts are refused
-  before anything is stored
-- `GET /api/v1/get-all` (empty version-0 snapshot — rulesets are not built)
-- A deterministic mock `AnalysisProvider`, so no test ever needs a live
-  provider
-- **Hybrid Analysis API v2 adapter** — contract verified against the official
-  OpenAPI document (3.0.0, docs v2.38.0); submission, polling, quota,
-  jittered bounded retries, strict response validation, size-bounded bodies
-- **Verdict normalization** into `malicious` / `suspicious` /
-  `no_threat_detected` / `inconclusive` / `unknown`, with the guarantee that no
-  failure path can produce `no_threat_detected`
-- Retry-safe submission: a job holding a provider scan ID is never
-  re-submitted
-
-Not implemented yet:
-
-- Ruleset generation (§5.5) — `get-all` returns an empty version-0 snapshot
-- Live Hybrid Analysis verification — the nine open questions in
-  [`hybrid-analysis-integration.md`](docs/hybrid-analysis-integration.md)
-- CI pipeline
-- Metrics / tracing (structured logs only)
-
-**What has not been proven:** that the Hybrid Analysis adapter produces correct
-verdicts against the real API. The contract was verified from the published
-OpenAPI document and every test uses a mock provider; the actual `verdict`
-string values are still unknown ([V1](docs/hybrid-analysis-integration.md#10-open-questions-requiring-manual-verification)).
-Until one controlled live call closes those questions, a
-`no_threat_detected` verdict from the real provider is unproven.
-
-## Note on the language choice
-
-The two source documents under `docs/architecture/` were written for a Laravel
-backend and state repeatedly that Go is out of scope for the MVP — see §2, §17
-of `CYBERGUARD_PROJECT.md` and the "Fixed technology choices" section of
-`CYBERGUARD_ARCHITECTURE_PROMPT.md`. This service is written in Go by explicit
-decision: [ADR 0009](docs/decisions/0009-go-as-only-backend-language.md).
-
-That contradiction is recorded rather than papered over: see
-[`docs/architecture.md` §7](docs/architecture.md#7-conflicts-found-during-review),
-which lists all twelve conflicts found during the review and how each was
-resolved. The Laravel statements in those two documents are superseded by the
-`docs/` review set, but have been left in place — they remain useful as a
-record of the original requirements.
+Anything older under `docs/` (architecture, ADRs, prior contract notes) is
+historical record from the previous, larger incarnation of this service and
+no longer reflects the current code.

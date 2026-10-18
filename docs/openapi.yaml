@@ -1,0 +1,805 @@
+openapi: 3.0.3
+
+# CyberGuard AI — API contract.
+#
+# This document is served by the API itself at /openapi.yaml (embedded at
+# build time), so what a client reads is byte-identical to this file. A
+# rendered, interactive version is served at /docs/.
+#
+# It is kept in sync with the implementation by tests: internal/handlers
+# asserts that the served contract contains both endpoints, that all
+# documented status codes are produced by the handlers, and that no
+# credential appears anywhere in this document.
+
+info:
+  title: CyberGuard AI API
+  version: 1.1.0
+  description: |
+    URL threat-checking backend for the CyberGuard AI website.
+
+    A client submits a URL; the backend serves the answer from its MongoDB
+    cache when one is usable, and otherwise asks Hybrid Analysis and stores
+    the real result it reports. `GET /api/v1/get-all` reads the stored
+    assessments back, newest stored first.
+
+    ## Provider usage
+
+    Two documented Hybrid Analysis v2 endpoints are used, in this order:
+
+    1. `POST /quick-scan/url` — submit a URL. Called **at most once per
+       request**, and only when MongoDB holds no usable record for the URL.
+    2. `GET /quick-scan/{id}` — retrieve the updated result. The official
+       specification says: `finished` may be `false` on submission, "then you
+       need use this endpoint to get final results". The backend polls it with
+       a bounded timeout and fixed interval until the provider reports
+       `finished: true`, the request budget is exhausted, or the provider
+       fails.
+
+    The API key lives only in the backend environment. It is never exposed to
+    clients, in responses, in this document, or in logs.
+
+    ## Caching and one-record-per-URL
+
+    - The URL is canonicalized once (`https` domain names lowered, default
+      ports `80`/`443` dropped, fragments dropped; path and query preserved
+      byte for byte so signed links keep working). The SHA-256 of that
+      canonical form is the cache key.
+    - MongoDB is consulted first. A **completed** assessment newer than the
+      configured cache lifetime (`ASSESSMENT_TTL`, default 24h) is returned
+      without any provider call (HTTP 200).
+    - A **pending** record is resumed: the request reuses its existing
+      provider id and polls for the result instead of submitting the URL
+      again. Older pending records are re-submitted once.
+    - Equivalent concurrent requests inside one process are admitted one at a
+      time; across processes the database enforces one record per canonical
+      URL (unique partial index). A request that loses a write race adopts the
+      winner's record rather than creating a second one.
+    - A completed record whose data has aged past `ASSESSMENT_TTL` is
+      assessed again and updated **in place**; there is never a second record
+      for the same canonical URL.
+
+    ## Result semantics
+
+    `data.status` reports the app-level state:
+
+    - `"completed"` — the provider reported `finished: true` and the stored
+      result is final.
+    - `"pending"` — the provider accepted the analysis but has not reported
+      `finished: true` yet. A later check-url call through this same endpoint
+      resumes it.
+
+    `data.verdict` is a normalized conclusion, never invented:
+
+    | Verdict | Meaning |
+    |---|---|
+    | `malicious` | at least one provider scanner classified maliciously |
+    | `suspicious` | at least one scanner classified suspiciously and none maliciously |
+    | `no_threat_detected` | every scanner that produced data reported a benign classification (clean / no specific threat / whitelisted) |
+    | `inconclusive` | the finished scan has unresolved or errored scanners, or conflicting evidence the ladder above does not rank |
+    | `unknown` | the finished scan evaluated nothing usable |
+
+    `verdict` is `null` whenever `status` is `"pending"`: a scan the provider
+    has not finished has no verdict. Verdicts are derived only from
+    `finished: true` responses; provider errors are never read as verdicts,
+    and a SHA-256 digest without scanner evidence proves nothing either way.
+
+    ## Errors
+
+    Every error response uses the same envelope as successes
+    (`success: false`) plus a stable machine-readable `error.code`. Codes:
+
+    | Code | Meaning |
+    |---|---|
+    | `invalid_request` | the request body or query parameters are malformed |
+    | `validation_error` | the URL failed validation (empty, malformed, unsupported scheme, missing host, too long) |
+    | `provider_not_configured` | `HYBRID_ANALYSIS_API_KEY` is not set server-side |
+    | `provider_auth_failed` | the provider rejected the configured API key |
+    | `provider_rate_limited` | the provider returned 429; honour `Retry-After` |
+    | `provider_timeout` | the provider did not respond within its budget; nothing was recorded |
+    | `provider_rejected` | the provider refused the request (submission or retrieval) |
+    | `provider_unavailable` | the provider is unreachable or erred; an existing pending record stays pending |
+    | `provider_bad_response` | the provider's response was unparseable; nothing was recorded |
+    | `request_in_progress` | an equivalent request for this URL is being analysed right now; retry shortly |
+    | `store_unavailable` | MongoDB rejected the read or write |
+    | `method_not_allowed` | the HTTP method is not supported on this path |
+    | `not_found` | no endpoint matches the path |
+
+tags:
+  - name: URL checks
+    description: Check a URL for threats (cache-backed) and read stored results.
+  - name: Health
+    description: Process liveness and readiness.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development (docker compose or `go run ./cmd/api`).
+
+paths:
+  /api/v1/check-url:
+    post:
+      operationId: checkUrl
+      tags: [URL checks]
+      summary: Check a URL against the cache and the threat-analysis provider
+      description: |
+        Validates and canonicalizes the URL, looks it up in MongoDB, and:
+
+        - returns the stored assessment (HTTP 200) when a completed result is
+          cached and still fresh — no provider call is made;
+        - resumes a pending assessment with its existing provider id and polls
+          the documented retrieval endpoint until it finishes (HTTP 200) or
+          the request budget runs out (HTTP 202);
+        - otherwise submits the URL to the provider exactly once, persists
+          whatever the provider reported, and polls for the final result the
+          same way.
+
+        HTTP 200 means a completed assessment is available; HTTP 202 means the
+        analysis is still running provider-side and the client should check
+        again later — the same call simply resumes it. Read `data.verdict`
+        (null while pending) rather than only the HTTP status.
+
+        A provider failure stores nothing new: an existing pending record
+        stays pending, and errors are never returned as if they were results.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CheckURLRequest'
+            examples:
+              simple:
+                summary: A plain https URL
+                value:
+                  url: https://example.com
+      responses:
+        '200':
+          description: |
+            A completed assessment is available — served from the cache, or
+            finished and normalized within this request. `data.status` is
+            `"completed"` and `data.verdict` is set.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckURLResponse'
+              examples:
+                cachedHit:
+                  summary: Served from MongoDB without contacting the provider
+                  value:
+                    success: true
+                    message: URL analysis completed
+                    data:
+                      id: 6f3b1c9a2d4e5f60718293a4
+                      url: https://example.com
+                      provider: hybrid-analysis
+                      providerId: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a10
+                      sha256: 1db1b0b12b19c8cebb75e19c1e4b6d9ad1e0a29f0e27a419e0f4f0efb1f2e0e1
+                      scanType: all
+                      status: completed
+                      finished: true
+                      scannersV2:
+                        bfore_ai:
+                          status: no specific threat
+                          progress: 100
+                        clean_dns:
+                          status: no specific threat
+                          progress: 100
+                      verdict: no_threat_detected
+                      createdAt: '2026-10-17T10:00:00Z'
+                      updatedAt: '2026-10-17T10:00:00Z'
+                finishedNow:
+                  summary: Submitted once, retrieved and normalized in this request
+                  value:
+                    success: true
+                    message: URL analysis completed
+                    data:
+                      id: 6f3b1c9a2d4e5f60718293a6
+                      url: https://example.com
+                      provider: hybrid-analysis
+                      providerId: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a12
+                      sha256: 1db1b0b12b19c8cebb75e19c1e4b6d9ad1e0a29f0e27a419e0f4f0efb1f2e0e1
+                      scanType: all
+                      status: completed
+                      finished: true
+                      scannersV2:
+                        bfore_ai:
+                          status: no specific threat
+                          progress: 100
+                      verdict: no_threat_detected
+                      createdAt: '2026-10-17T10:00:04Z'
+                      updatedAt: '2026-10-17T10:00:09Z'
+        '202':
+          description: |
+            The analysis did not finish within this request's budget. The
+            stored record (or the cached pending record) is returned with
+            `data.status` `"pending"` and `data.verdict` `null`; a later call
+            with the same URL resumes the existing assessment instead of
+            submitting it again.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckURLResponse'
+              example:
+                success: true
+                message: Analysis is still in progress
+                data:
+                  id: 6f3b1c9a2d4e5f60718293a5
+                  url: https://example.com
+                  provider: hybrid-analysis
+                  providerId: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a11
+                  scanType: all
+                  status: pending
+                  finished: false
+                  verdict: null
+                  createdAt: '2026-10-17T10:00:05Z'
+                  updatedAt: '2026-10-17T10:00:35Z'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+        '504':
+          $ref: '#/components/responses/ProviderTimeout'
+
+  /api/v1/get-all:
+    get:
+      operationId: getAllResults
+      tags: [URL checks]
+      summary: List stored assessments, newest stored first
+      description: |
+        Reads stored assessments from MongoDB, ordered by their last
+        update time (newest first) — a record that just obtained its final
+        result sorts near the top. No provider request is made, no analysis
+        is started, and no field is derived from anything other than what the
+        provider previously returned.
+      parameters:
+        - name: page
+          in: query
+          description: 1-based page number.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000000
+            default: 1
+        - name: limit
+          in: query
+          description: Page size.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+      responses:
+        '200':
+          description: One page of stored assessments, newest first. The body's
+            `data` is `[]` for an empty collection.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetAllResponse'
+              examples:
+                oneItem:
+                  summary: A collection with one stored result
+                  value:
+                    success: true
+                    data:
+                      - id: 6f3b1c9a2d4e5f60718293a4
+                        url: https://example.com
+                        provider: hybrid-analysis
+                        providerId: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a10
+                        sha256: 1db1b0b12b19c8cebb75e19c1e4b6d9ad1e0a29f0e27a419e0f4f0efb1f2e0e1
+                        scanType: all
+                        status: completed
+                        finished: true
+                        scannersV2:
+                          bfore_ai:
+                            status: no specific threat
+                            progress: 100
+                        verdict: no_threat_detected
+                        createdAt: '2026-10-17T10:00:00Z'
+                        updatedAt: '2026-10-17T10:00:00Z'
+                    pagination:
+                      page: 1
+                      limit: 20
+                      total: 1
+                      totalPages: 1
+                empty:
+                  summary: Nothing stored yet
+                  value:
+                    success: true
+                    data: []
+                    pagination:
+                      page: 1
+                      limit: 20
+                      total: 0
+                      totalPages: 0
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '405':
+          $ref: '#/components/responses/MethodNotAllowed'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /health/live:
+    get:
+      operationId: healthLive
+      tags: [Health]
+      summary: Liveness probe
+      description: Reports process health only; it never touches MongoDB or the provider.
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+  /health/ready:
+    get:
+      operationId: healthReady
+      tags: [Health]
+      summary: Readiness probe
+      description: Probes MongoDB. A missing provider API key is reported in `checks` without failing readiness.
+      responses:
+        '200':
+          description: The service can do useful work.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ready
+                  checks:
+                    type: object
+                    additionalProperties:
+                      type: string
+        '503':
+          description: A dependency is unreachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: not_ready
+                  checks:
+                    type: object
+                    additionalProperties:
+                      type: string
+
+components:
+  schemas:
+    CheckURLRequest:
+      type: object
+      required: [url]
+      additionalProperties: false
+      properties:
+        url:
+          type: string
+          description: A valid HTTP or HTTPS URL. Other schemes, missing
+            hosts, control characters and input over 2048 characters are
+            rejected with `422`. The value is canonicalized before lookup,
+            storage and submission; `HTTPS://Example.com:443/#frag` and
+            `https://example.com` hit the same cache entry.
+          maxLength: 2048
+          example: https://example.com
+
+    CheckURLResponse:
+      type: object
+      required: [success, message, data]
+      properties:
+        success:
+          type: boolean
+          example: true
+        message:
+          type: string
+          description: '"URL analysis completed" for HTTP 200 (a completed
+            assessment); "Analysis is still in progress" for HTTP 202 (the
+            scan continues provider-side), uniformly for cached and freshly
+            started analyses.'
+          example: URL analysis completed
+        data:
+          $ref: '#/components/schemas/SubmissionItem'
+
+    GetAllResponse:
+      type: object
+      required: [success, data, pagination]
+      properties:
+        success:
+          type: boolean
+          example: true
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/SubmissionItem'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    SubmissionItem:
+      type: object
+      description: |
+        One stored assessment. Fields marked "provider passthrough" carry the
+        provider's own data verbatim. `status`, `verdict` and `updatedAt` are
+        computed by this backend under the documented policy in `info`.
+      required: [id, url, provider, scanType, status, finished, verdict, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          description: Internal MongoDB document ID.
+          example: 6f3b1c9a2d4e5f60718293a4
+        url:
+          type: string
+          description: The canonicalized URL; lookups use the same form, so
+            cache reuse is deterministic.
+          example: https://example.com
+        provider:
+          type: string
+          description: Always `hybrid-analysis` for a stored record.
+          example: hybrid-analysis
+        providerId:
+          type: string
+          description: The provider-issued quick scan `id` this record is
+            bound to. A pending record is resumed through it instead of
+            submitting the same URL again.
+          example: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a10
+        sha256:
+          type: string
+          description: Provider-reported sample digest, when reported.
+            Presence of a digest alone is not evidence of any verdict.
+          example: 1db1b0b12b19c8cebb75e19c1e4b6d9ad1e0a29f0e27a419e0f4f0efb1f2e0e1
+        scanType:
+          type: string
+          description: The documented `scan_type` the submission used.
+          example: all
+          enum:
+            - all
+            - all_lookup
+            - all_scan
+            - lookup_ha
+            - lookup_cleandns
+            - lookup_bforeai
+            - scan_crowdstrike_ml
+            - scan_metadefender
+            - scan_urlscanio
+            - scan_scamadviser
+            - scan_criminalip
+            - scan_vipre
+        status:
+          type: string
+          description: |
+            `"completed"` only when the provider reported `finished: true`;
+            `"pending"` while the analysis has not finished. Records written
+            by older versions of this service may still read `"submitted"`
+            after an upgrade; they behave exactly like `"pending"`.
+          enum: [pending, completed]
+          example: completed
+        finished:
+          type: boolean
+          description: The provider's own completion flag, passed through.
+          example: true
+        scanners:
+          type: array
+          description: Per-scanner data from the provider's deprecated
+            `scanners` array, when the provider still sends one. It is
+            classified by the same rules as `scannersV2` for `verdict`.
+          items:
+            $ref: '#/components/schemas/Scanner'
+        scannersV2:
+          type: object
+          description: |
+            The provider's `scanners_v2` object passed through verbatim.
+            Inner keys are the provider's (for example `crowdstrike_ml`,
+            `metadefender`, `virustotal`, `urlscan_io`, `scam_adviser`,
+            `clean_dns`, `bfore_ai`, `criminal_ip`, `vipre`), not this API's.
+            Absent when the provider sent none. This is the authoritative
+            per-scanner data; a `null` entry means that scanner produced no
+            data at all and is never treated as a clean result.
+          additionalProperties: true
+        reports:
+          type: array
+          description: Provider report references, when returned.
+          items:
+            type: string
+        verdict:
+          nullable: true
+          type: string
+          description: |
+            `null` while `status` is `"pending"`. Otherwise a normalized
+            conclusion under the documented policy: malicious > suspicious >
+            no_threat_detected > inconclusive > unknown. A scanner failure or
+            missing scanner data never becomes a clean verdict; the provider's
+            error responses never become verdicts at all.
+          enum: [malicious, suspicious, no_threat_detected, inconclusive, unknown]
+          example: no_threat_detected
+        createdAt:
+          type: string
+          format: date-time
+          description: When the record was first stored (UTC). Rescans of an
+            expired assessment preserve it.
+          example: '2026-10-17T10:00:00Z'
+        updatedAt:
+          type: string
+          format: date-time
+          description: When the record was last written (UTC); get-all sorts
+            on this.
+          example: '2026-10-17T10:00:00Z'
+
+    Scanner:
+      type: object
+      description: One scanner entry. Fields the provider may omit are absent,
+        not zero.
+      required: [name, status, statusRaw, progress]
+      properties:
+        name:
+          type: string
+          example: crowdstrike_ml
+        status:
+          type: string
+          description: Provider status as presented at the provider's UI.
+          example: no specific threat
+        statusRaw:
+          type: string
+          description: The provider's original status token.
+          example: NO_DETECTION
+        errorMessage:
+          nullable: true
+          type: string
+        progress:
+          type: integer
+          example: 100
+        total:
+          nullable: true
+          type: integer
+        positives:
+          nullable: true
+          type: integer
+          description: Detections reported by the scanner, when reported.
+        percent:
+          nullable: true
+          type: integer
+        antiVirusResults:
+          type: array
+          description: Populated by the provider only for keys with default
+            privileges or higher.
+          items:
+            $ref: '#/components/schemas/AntiVirusResult'
+
+    AntiVirusResult:
+      type: object
+      required: [name, result, threatFound]
+      properties:
+        name:
+          type: string
+          example: Vipre
+        result:
+          type: boolean
+        threatFound:
+          type: string
+
+    Pagination:
+      type: object
+      required: [page, limit, total, totalPages]
+      properties:
+        page:
+          type: integer
+          example: 1
+        limit:
+          type: integer
+          example: 20
+        total:
+          type: integer
+          format: int64
+          description: Total stored assessments across all pages.
+          example: 1
+        totalPages:
+          type: integer
+          format: int64
+          description: Zero when the collection is empty.
+          example: 1
+
+    ErrorResponse:
+      type: object
+      required: [success, message, error]
+      properties:
+        success:
+          type: boolean
+          example: false
+        message:
+          type: string
+          description: A client-safe description. It never contains the
+            submitted URL, a provider message, or any credential.
+          example: url scheme "ftp" is not supported; only http and https are allowed
+        error:
+          type: object
+          required: [code, status]
+          properties:
+            code:
+              type: string
+              description: Stable machine-readable code; branch on this, not on
+                the message.
+              example: validation_error
+            status:
+              type: integer
+              example: 422
+
+  responses:
+    BadRequest:
+      description: Malformed JSON body, unknown fields, unsupported content
+        type, or invalid pagination parameters.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            malformedJSON:
+              value:
+                success: false
+                message: request body must be a JSON object with a "url" field
+                error:
+                  code: invalid_request
+                  status: 400
+            badPagination:
+              value:
+                success: false
+                message: limit must be at most 100
+                error:
+                  code: invalid_request
+                  status: 400
+
+    MethodNotAllowed:
+      description: The endpoint exists but not for this HTTP method.
+      headers:
+        Allow:
+          schema:
+            type: string
+            example: POST
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: this endpoint accepts POST
+            error:
+              code: method_not_allowed
+              status: 405
+
+    ValidationError:
+      description: The URL was rejected before anything was stored or sent to
+        the provider.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            unsupportedScheme:
+              value:
+                success: false
+                message: url scheme "ftp" is not supported; only http and https are allowed
+                error:
+                  code: validation_error
+                  status: 422
+            missingHost:
+              value:
+                success: false
+                message: url is missing a host
+                error:
+                  code: validation_error
+                  status: 422
+
+    RateLimited:
+      description: The provider rate limited the request — while submitting or
+        mid-poll. Nothing false is stored; an existing pending record stays
+        pending. Honour `Retry-After` and retry.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds, derived from the provider's own Retry-After
+            when it sent one, otherwise omitted.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: the analysis provider rate limited the request; please retry later
+            error:
+              code: provider_rate_limited
+              status: 429
+
+    ProviderError:
+      description: The provider refused, erred, or answered unintelligibly.
+        Nothing was recorded, so no result can be mistaken for a successful
+        one; a pending record for this URL simply stays pending.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            authFailed:
+              value:
+                success: false
+                message: the analysis provider rejected the configured API key
+                error:
+                  code: provider_auth_failed
+                  status: 502
+            rejected:
+              value:
+                success: false
+                message: the analysis provider rejected the request
+                error:
+                  code: provider_rejected
+                  status: 502
+            unavailable:
+              value:
+                success: false
+                message: the analysis provider is unavailable; please retry later
+                error:
+                  code: provider_unavailable
+                  status: 502
+            unexpectedResponse:
+              value:
+                success: false
+                message: the analysis provider returned an unexpected response
+                error:
+                  code: provider_bad_response
+                  status: 502
+
+    ProviderTimeout:
+      description: The provider did not answer within its configured budget.
+        A submission is **not** retried automatically — the endpoint declares
+        no idempotency token, so an ambiguous submission may already have been
+        accepted upstream — and nothing false is recorded.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            success: false
+            message: the analysis provider did not respond in time; the analysis stays pending
+            error:
+              code: provider_timeout
+              status: 504
+
+    ServiceUnavailable:
+      description: MongoDB refused the read or write, the provider is not
+        configured server-side, or an equivalent request for the same URL is
+        being analysed right now and no verifiable record could be served.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          examples:
+            storeUnavailable:
+              value:
+                success: false
+                message: stored results could not be read; please retry
+                error:
+                  code: store_unavailable
+                  status: 503
+            providerNotConfigured:
+              value:
+                success: false
+                message: the analysis provider is not configured; set HYBRID_ANALYSIS_API_KEY
+                error:
+                  code: provider_not_configured
+                  status: 503
+            requestInProgress:
+              value:
+                success: false
+                message: another request for this URL is being analysed; please retry shortly
+                error:
+                  code: request_in_progress
+                  status: 503

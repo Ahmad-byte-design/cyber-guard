@@ -2,12 +2,11 @@
 #
 # Scope: the Go backend only. There is no frontend, so nothing here builds one.
 #
-# Credentials: none. The workflow builds the image without arguments containing
-# secrets, and every check that needs a provider uses the mock.
-#
-# The module path is still the placeholder `cyberguard/server`, because no Git
-# remote is configured. Nothing here assumes a repository URL, and the module
-# path is not modified.
+# Credentials: none. No Hybrid Analysis key is available to a pull request and
+# none is needed: provider behaviour is faked with httptest, so every path
+# this workflow exercises is deterministic. The compose smoke test therefore
+# asserts exactly what a key-less deployment can answer: request validation,
+# the provider_not_configured response, the store endpoints and the docs.
 
 name: backend
 
@@ -17,9 +16,7 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A new push supersedes an in-progress run of the same ref. Without this, a
-# queued series of pushes burns the runner budget re-checking commits nobody
-# will fetch.
+# A new push supersedes an in-progress run of the same ref.
 concurrency:
   group: backend-${{ github.ref }}
   cancel-in-progress: true
@@ -31,9 +28,10 @@ env:
   GO_VERSION: "1.27"
 
 jobs:
-  # Fast feedback first: formatting, vet and build need no services at all.
-  static:
-    name: format, vet, build
+  # Fast feedback first: formatting, hygiene, vet, build and unit tests need
+  # no running services.
+  checks:
+    name: format, vet, build, unit tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -49,123 +47,48 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('server/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
           restore-keys: ${{ runner.os }}-go-
 
       - name: gofmt
-        working-directory: server
         run: |
           unformatted="$(gofmt -l .)"
           if [ -n "$unformatted" ]; then
             echo "These files are not gofmt-clean:"
             echo "$unformatted"
-            echo "Run: docker compose run --rm go gofmt -w ."
+            echo "Run: docker compose run --rm go gofmt -w cmd internal docs"
             exit 1
           fi
           echo "gofmt clean"
 
-      # go mod tidy must be a no-op. A non-empty diff means the committed
-      # go.mod or go.sum does not describe the module, and the next person's
-      # build would silently re-resolve versions.
+      # go mod tidy must be a no-op: a non-empty diff means the committed
+      # go.mod/go.sum do not describe the module.
       - name: go mod tidy is a no-op
-        working-directory: server
         run: |
           go mod tidy
           if ! git diff --quiet -- go.mod go.sum; then
             echo "go mod tidy changed the tree:"
             git diff -- go.mod go.sum
-            echo "Run: docker compose run --rm go go mod tidy"
             exit 1
           fi
           echo "go.mod and go.sum are tidy"
 
-      - name: go vet
-        working-directory: server
-        run: go vet ./...
+      - run: go vet ./...
 
-      - name: go vet (integration build tag)
-        working-directory: server
-        run: go vet -tags integration ./...
-
-      - name: go build
-        working-directory: server
-        run: go build ./...
-
-  # Unit tests need no external service, so they run in the fast job and fail
-  # without waiting for MongoDB to start.
-  unit:
-    name: unit tests and race detector
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-
-      - name: Cache Go modules and build cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('server/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+      - run: go build ./...
 
       # -race needs cgo, which needs a C toolchain.
-      - name: Install C toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc
+      - name: unit tests (with race detector)
+        run: |
+          sudo apt-get update && sudo apt-get install -y gcc
+          CGO_ENABLED=1 go test -race -count=1 -cover -coverprofile=coverage.out ./...
 
-      - name: go test
-        working-directory: server
-        run: go test -count=1 -covermode=atomic -coverprofile=coverage.out ./...
-
-      - name: go test -race
-        working-directory: server
-        run: CGO_ENABLED=1 go test -race -count=1 ./...
-
-      - name: Upload coverage
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: coverage
-          path: server/coverage.out
-          if-no-files-found: ignore
-
-  # Integration tests against real MongoDB.
-  #
-  # MongoDB is the only datastore: the scans collection is the work queue and
-  # the rate-limit counters are in-process, so there is nothing else to start.
-  # It is pinned to 9.0 for the reason in docker-compose.yml: 8.0 refuses to
-  # start on kernel 6.19+.
+  # The store's only direct tests (index creation, insertion, newest-first
+  # paging) need a real MongoDB. Everything else stays fake — no provider is
+  # contacted here either.
   integration:
-    name: integration tests
+    name: store tests against real MongoDB
     runs-on: ubuntu-latest
-    services:
-      mongodb:
-        image: mongo:9.0
-        ports:
-          - 27017:27017
-        options: >-
-          --health-cmd "mongosh --quiet --eval 'db.adminCommand({ping:1}).ok'"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-          --health-start-period 20s
-    env:
-      MONGODB_URI: mongodb://localhost:27017
-      # Each integration package uses its own database, so one that drops its
-      # collections cannot delete another's data mid-run.
-      MONGODB_DATABASE: cyberguard_ci
-      # Ruleset generation is exercised; no provider is contacted either way.
-      ANALYSIS_PROVIDER: mock
-      URL_FINGERPRINT_HMAC_KEY: ci-fingerprint-key-not-a-secret
-      # Must be hex, because config.Load decodes it: a value that is not
-      # hex-decodable fails the load, and every package that calls Load then
-      # reports a config failure instead of its own result. 64 hex characters is
-      # what `openssl rand -hex 32` produces — the same shape the local .env has.
-      URL_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
     steps:
       - uses: actions/checkout@v4
 
@@ -180,70 +103,31 @@ jobs:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('server/go.sum') }}
+          key: ${{ runner.os }}-go-${{ hashFiles('go.sum') }}
           restore-keys: ${{ runner.os }}-go-
 
-      - name: Install C toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc
-
-      - name: go test -tags integration
-        working-directory: server
-        run: go test -count=1 -tags integration ./...
-
-      # -race on the integration tests as well: the concurrency guarantees
-      # being checked (dedup, version races, the rate limiter) are exactly the
-      # ones a data race would corrupt silently.
-      - name: go test -race -tags integration
-        working-directory: server
-        run: CGO_ENABLED=1 go test -race -count=1 -tags integration ./...
-
-  # The image must build, because a broken Dockerfile is invisible to every
-  # other job.
-  image:
-    name: docker image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: docker/setup-buildx-action@v3
-
-      - name: Build the API image
-        uses: docker/build-push-action@v6
-        with:
-          context: ./server
-          push: false
-          load: true
-          tags: cyberguard-server:ci
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Smoke test the built binaries
+      - name: Start MongoDB
         run: |
-          set -euo pipefail
-          # --version must work with no configuration, no network and no
-          # secret: it is the one thing that must not depend on a running
-          # service, a datastore or a provider.
-          #
-          # --entrypoint is required. The image's entrypoint is already
-          # cyberguard-api, so passing the binary name as an argument yields
-          # "cyberguard-api cyberguard-api -version"; Go's flag package stops
-          # at the first non-flag argument, -version is never seen, and the
-          # process falls through to config validation and exits 1.
-          for binary in cyberguard-api cyberguard-migrate; do
-            output="$(docker run --rm --entrypoint "/usr/local/bin/$binary" \
-              cyberguard-server:ci -version)"
-            echo "$output"
-            case "$output" in
-              "$binary "*) ;;
-              *) echo "$binary did not report its version"; exit 1 ;;
-            esac
+          sudo docker run -d --name ci-mongo -p 27017:27017 mongo:9.0
+          for _ in $(seq 1 30); do
+            if sudo docker exec ci-mongo mongosh --quiet \
+                 --eval "db.adminCommand('ping').ok" | grep -q 1; then
+              exit 0
+            fi
+            sleep 2
           done
+          echo "mongodb did not become ready"; exit 1
 
-  # The compose topology is where the migration-ordering bug lived: a
-  # deployment that started without its indexes silently lost deduplication.
-  # This job exists so that ordering is exercised, not just the Dockerfile.
+      - name: Store tests
+        env:
+          MONGO_TEST_URI: mongodb://localhost:27017
+        run: go test -count=1 -run TestStore ./internal/mongodb
+
+  # The image must build, and the compose topology must come up healthy.
+  # This exercises the Dockerfile, the healthchecks, the depends_on ordering
+  # and the key-less runtime behaviour end to end.
   compose:
-    name: compose topology
+    name: compose topology and smoke test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -251,89 +135,69 @@ jobs:
       - name: Build and start the stack
         run: docker compose up -d --build --wait --wait-timeout 180
 
-      - name: The migration must have run before the services
+      - name: Health endpoints
         run: |
           set -euo pipefail
-          # migrate is a one-shot service; anything other than exit code 0 means
-          # the schema step failed and the API would be running without indexes.
-          status="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' cyberguard-migrate)"
-          echo "migrate: $status"
-          case "$status" in
-            "exited 0") ;;
-            *) echo "the schema migration did not succeed"; exit 1 ;;
-          esac
+          curl -fsS http://localhost:8080/health/live | grep -q '"status":"ok"'
+          curl -fsS http://localhost:8080/health/ready | grep -q '"status":"ready"'
 
-      - name: The required indexes exist
+      # No API key exists in CI, so check-url must fail closed with
+      # provider_not_configured — and request validation runs first, so its
+      # own errors come back before anything provider-shaped.
+      - name: check-url fails closed without a key
         run: |
           set -euo pipefail
-          docker compose exec -T mongodb mongosh --quiet cyberguard --eval '
-            const need = {
-              scans: ["uniq_active_scan", "by_claimable"],
-              assessments: ["ttl_expires_at"],
-              transient_urls: ["ttl_expires_at"]
-            };
-            let bad = false;
-            for (const [coll, names] of Object.entries(need)) {
-              const have = db.getCollection(coll).getIndexes().map(i => i.name);
-              for (const n of names) {
-                if (!have.includes(n)) { print(`MISSING ${coll}.${n}`); bad = true; }
-              }
-            }
-            if (bad) { quit(1); }
-            print("all required indexes present");
+          tip() { python3 -c 'import json,sys; b=json.load(sys.stdin); sys.exit(0 if b["success"] is False else 1)'; }
+          echo "--- malformed JSON body ---"
+          code="$(curl -sS -o /tmp/r1.json -w '%{http_code}' \
+            -X POST http://localhost:8080/api/v1/check-url \
+            -H 'Content-Type: application/json' \
+            -d 'not-json')"
+          echo "$code $(cat /tmp/r1.json)"
+          [ "$code" = "400" ]
+          cat /tmp/r1.json | tip
+          grep -q '"code":"invalid_request"' /tmp/r1.json
+          echo "--- unsupported scheme ---"
+          code="$(curl -sS -o /tmp/r2.json -w '%{http_code}' \
+            -X POST http://localhost:8080/api/v1/check-url \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"ftp://example.invalid/x"}')"
+          echo "$code $(cat /tmp/r2.json)"
+          [ "$code" = "422" ]
+          cat /tmp/r2.json | tip
+          grep -q '"code":"validation_error"' /tmp/r2.json
+          echo "--- valid URL, no key configured ---"
+          code="$(curl -sS -o /tmp/r3.json -w '%{http_code}' \
+            -X POST http://localhost:8080/api/v1/check-url \
+            -H 'Content-Type: application/json' \
+            -d '{"url":"https://example.invalid/"}')"
+          echo "$code $(cat /tmp/r3.json)"
+          [ "$code" = "503" ]
+          grep -q '"code":"provider_not_configured"' /tmp/r3.json
+          echo "check-url failed closed correctly"
+
+      - name: get-all works empty
+        run: |
+          set -euo pipefail
+          body="$(curl -fsS 'http://localhost:8080/api/v1/get-all?page=1&limit=10')"
+          echo "$body"
+          cat <<<"$body" | python3 -c '
+            import json, sys
+            b = json.load(sys.stdin)
+            assert b["success"] is True
+            assert b["data"] == []
+            assert b["pagination"] == {"page": 1, "limit": 10, "total": 0, "totalPages": 0}
+            assert b["pagination"]["limit"] == 10
           '
 
-      - name: The API is running
+      - name: Documentation endpoints are served
         run: |
           set -euo pipefail
-          for _ in $(seq 1 30); do
-            if curl -fsS localhost:8080/health/ready > /tmp/ready.json; then break; fi
-            sleep 2
-          done
-          cat /tmp/ready.json
-          docker compose ps --status=running --services | grep -qx backend
-
-      - name: End-to-end scan with the mock provider
-        run: |
-          set -euo pipefail
-          # This also exercises the in-process scan runner: nothing else is
-          # running, so the poll below only succeeds if the API claimed its own
-          # scan out of the scans collection and analysed it. The submission
-          # must still return 202 with no verdict, which is the part of the
-          # contract a "just make it synchronous" fix would silently break.
-          code="$(curl -sS -o /tmp/submit.json -w '%{http_code}' \
-            -X POST localhost:8080/api/v1/check-url \
-            -H 'Content-Type: application/json' \
-            -d '{"url":"https://example.test/malicious/ci-check"}')"
-          echo "$code $(cat /tmp/submit.json)"
-          [ "$code" = "202" ] || { echo "check-url returned $code, want 202"; exit 1; }
-          grep -q '"cached":false' /tmp/submit.json
-          if grep -q '"verdict"' /tmp/submit.json; then
-            echo "a freshly queued scan carried a verdict"
-            exit 1
-          fi
-          scan="$(grep -o '"scan_id":"[^"]*"' /tmp/submit.json | cut -d'"' -f4)"
-
-          for _ in $(seq 1 30); do
-            result="$(curl -fsS "localhost:8080/api/v1/get-url/$scan")"
-            echo "$result"
-            case "$result" in *'"completed"'*) break ;; esac
-            sleep 2
-          done
-          printf '%s' "$result" | grep -q '"verdict":"malicious"'
-
-          # The ruleset must be servable. An empty version 0 is correct here
-          # because CI never produces two corroborated findings.
-          curl -fsS localhost:8080/api/v1/get-all
-
-      - name: The documentation endpoints are served
-        run: |
-          set -euo pipefail
-          # Swagger UI must render without any external network access, so the
+          # Swagger UI must render without external network access, so the
           # page may only reference same-origin relative assets.
-          curl -fsS localhost:8080/docs/ > /tmp/docs.html
+          curl -fsS http://localhost:8080/docs/ > /tmp/docs.html
           grep -q 'id="swagger-ui"' /tmp/docs.html
-          grep -q '../openapi.yaml' /tmp/docs.html
+          grep -q '"../openapi.yaml"' /tmp/docs.html
           if grep -qE '(src|href)="(https?:)?//' /tmp/docs.html; then
             echo "the page loads an asset from another origin:"
             grep -oE '(src|href)="[^"]*"' /tmp/docs.html
@@ -341,28 +205,16 @@ jobs:
           fi
 
           for asset in swagger-ui.css swagger-ui-bundle.js swagger-ui-standalone-preset.js; do
-            curl -fsS "localhost:8080/docs/assets/$asset" -o /dev/null
+            curl -fsS "http://localhost:8080/docs/assets/$asset" -o /dev/null
           done
 
           # The served contract must be the committed contract, byte for byte.
-          curl -fsS localhost:8080/openapi.yaml -o /tmp/live.yaml
-          if ! diff -q /tmp/live.yaml server/openapi.yaml > /dev/null; then
-            echo "the served specification differs from server/openapi.yaml"
+          curl -fsS http://localhost:8080/openapi.yaml -o /tmp/live.yaml
+          if ! diff -q /tmp/live.yaml docs/openapi.yaml > /dev/null; then
+            echo "the served specification differs from docs/openapi.yaml"
             exit 1
           fi
-
-          # Disabling documentation must remove it and leave the API alone.
-          API_DOCS_ENABLED=false docker compose up -d backend
-          for _ in $(seq 1 20); do
-            sleep 2
-            if curl -fsS localhost:8080/health/ready > /dev/null 2>&1; then break; fi
-          done
-          for path in /docs/ /openapi.yaml; do
-            code="$(curl -sS -o /dev/null -w '%{http_code}' "localhost:8080$path")"
-            [ "$code" = "404" ] || { echo "$path returned $code with docs disabled"; exit 1; }
-          done
-          curl -fsS localhost:8080/health/live > /dev/null
-          echo "documentation switch works and the API is unaffected"
+          echo "documentation served from embedded assets only"
 
       - name: Logs
         if: always()

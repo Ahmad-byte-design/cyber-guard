@@ -4,12 +4,12 @@
 .env.*
 !.env.example
 
-# --- Go build/test caches --------------------------------------------------
+# --- Go build/test caches (docker compose `go` toolchain) -------------------
 /.cache/
 
 # --- build output ----------------------------------------------------------
-/server/bin/
-/server/dist/
+# `go build ./...` drops the cmd/api binary into the package directory.
+/cmd/api/api
 *.exe
 *.test
 coverage.out
