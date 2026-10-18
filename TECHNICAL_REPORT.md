@@ -233,7 +233,7 @@ variables under Compose/process managers; **environment always wins**):
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `APP_PORT` | `8080` | Host port; the container always listens on 8080 |
-| `MONGODB_URI` | `mongodb://localhost:27017` | Connection string (Compose pins `mongodb://mongodb:27017`) |
+| `MONGODB_URI` | `mongodb://localhost:27017` | Connection string (Compose falls back to `mongodb://mongodb:27017` when unset) |
 | `MONGODB_DATABASE` | `cyberguard` | Database name |
 | `HYBRID_ANALYSIS_BASE_URL` | `https://hybrid-analysis.com/api/v2` | Provider base URL — **no `www`** (a Go client will not replay a POST body across the 301) |
 | `HYBRID_ANALYSIS_API_KEY` | *(empty)* | Without it, check-url answers `503 provider_not_configured` |
@@ -306,8 +306,10 @@ stored, never echoed in any API response.
 - `depends_on: service_healthy` ordering.
 - Distinct image tag (`cyberguard-api:go-local`) to avoid colliding with a
   sibling Laravel project that also builds `cyberguard-api:local`.
-- `APP_PORT` selects the **host** port only; `MONGODB_URI` is re-pinned inside
-  the network because the host `.env` value would be wrong there.
+- `APP_PORT` selects the **host** port only. `MONGODB_URI` defaults to
+  `mongodb://mongodb:27017` inside the network — the host `.env` value would be
+  wrong there — but an explicit value passes through, so pointing the stack at a
+  hosted Atlas SRV URI needs no compose edit.
 - A `go` tool service (profile `tools`) runs build/test/vet/gofmt against the
   host module without requiring Go on the host, matching host UID/GID with
   host-backed caches in `./.cache/`.

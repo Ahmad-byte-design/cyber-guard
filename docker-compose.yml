@@ -41,8 +41,10 @@ services:
       APP_PORT: ${APP_PORT:-8080}
       # Inside the Docker network the URI is the service name, never the
       # value .env carries for host runs (mongodb://localhost:27017), so it is
-      # re-pinned here even though env_file would otherwise supply it.
-      MONGODB_URI: mongodb://mongodb:27017
+      # defaulted here rather than hardcoded. The default keeps the local stack
+      # working against the bundled MongoDB, while an explicit MONGODB_URI in
+      # .env (a hosted Atlas SRV string, say) still wins and is passed through.
+      MONGODB_URI: "${MONGODB_URI:-mongodb://mongodb:27017}"
       MONGODB_DATABASE: ${MONGODB_DATABASE:-cyberguard}
       # There is no `www` in the base URL: that is the host the official v2
       # specification declares, and the www host answers 301 to it. A Go

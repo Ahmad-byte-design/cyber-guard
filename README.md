@@ -140,7 +140,7 @@ Every variable is optional; sensible defaults fit `docker compose`.
 | Variable                         | Default                                  | Meaning                                                                                        |
 | -------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `APP_PORT`                       | `8080`                                   | HTTP port (host port under Compose; the container always listens on 8080)                       |
-| `MONGODB_URI`                    | `mongodb://localhost:27017`              | MongoDB connection string (Compose overrides to `mongodb://mongodb:27017`)                      |
+| `MONGODB_URI`                    | `mongodb://localhost:27017`              | MongoDB connection string (Compose falls back to `mongodb://mongodb:27017` when unset)          |
 | `MONGODB_DATABASE`               | `cyberguard`                             | Database name (collections: `url_submissions`, `ruleset_state`)                                  |
 | `HYBRID_ANALYSIS_BASE_URL`       | `https://hybrid-analysis.com/api/v2`     | Provider base URL — see the "no www" note under Limitations                                     |
 | `HYBRID_ANALYSIS_API_KEY`        | *(empty)*                                | Hybrid Analysis API key. Without it check-url answers `503 provider_not_configured`             |
