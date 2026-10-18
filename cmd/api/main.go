@@ -126,6 +126,7 @@ func realMain() error {
 		// The wait budget draws from the same provider budget the client
 		// uses; WriteTimeout below adds the recording margin on top.
 		WaitBudget: cfg.HATimeout,
+		Logger:     logger,
 	})
 
 	srv := &http.Server{

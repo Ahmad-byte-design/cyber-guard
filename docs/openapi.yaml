@@ -13,14 +13,18 @@ openapi: 3.0.3
 
 info:
   title: CyberGuard AI API
-  version: 1.1.0
+  version: 1.3.0
   description: |
     URL threat-checking backend for the CyberGuard AI website.
 
     A client submits a URL; the backend serves the answer from its MongoDB
     cache when one is usable, and otherwise asks Hybrid Analysis and stores
-    the real result it reports. `GET /api/v1/get-all` reads the stored
-    assessments back, newest stored first.
+    the real result it reports. `GET /api/v1/get-all` is the version-aware
+    ruleset sync: a client sends the ruleset version it already installed and
+    receives either an empty array with "up to date" in the synchronization
+    headers, or the complete current ruleset as a verbatim installable array
+    of declarativeNetRequest rules. A confirmed-threat check-url response
+    carries the matching single rule as `data.rule`.
 
     ## Provider usage
 
@@ -137,6 +141,13 @@ paths:
         again later — the same call simply resumes it. Read `data.verdict`
         (null while pending) rather than only the HTTP status.
 
+        A confirmed threat (`data.verdict` `"malicious"` or `"suspicious"`)
+        also carries `data.rule`: the one dynamic declarativeNetRequest rule
+        for that URL, exactly what the get-all ruleset delivers apart from
+        its missing `id` (the extension assigns one when installing it
+        dynamically). Clean and pending answers have no `rule` field at
+        all.
+
         A provider failure stores nothing new: an existing pending record
         stays pending, and errors are never returned as if they were results.
       requestBody:
@@ -192,7 +203,7 @@ paths:
                     message: URL analysis completed
                     data:
                       id: 6f3b1c9a2d4e5f60718293a6
-                      url: https://example.com
+                      url: https://confirmed-malicious.example/download
                       provider: hybrid-analysis
                       providerId: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a12
                       sha256: 1db1b0b12b19c8cebb75e19c1e4b6d9ad1e0a29f0e27a419e0f4f0efb1f2e0e1
@@ -201,11 +212,26 @@ paths:
                       finished: true
                       scannersV2:
                         bfore_ai:
-                          status: no specific threat
+                          status: malicious
                           progress: 100
-                      verdict: no_threat_detected
+                      verdict: malicious
                       createdAt: '2026-10-17T10:00:04Z'
                       updatedAt: '2026-10-17T10:00:09Z'
+                      rule:
+                        priority: 1
+                        action:
+                          type: block
+                        condition:
+                          urlFilter: '||confirmed-malicious.example^/download|'
+                          resourceTypes:
+                            - main_frame
+                            - sub_frame
+                            - script
+                            - xmlhttprequest
+                            - ping
+                            - websocket
+                            - webtransport
+                          isUrlFilterCaseSensitive: true
         '202':
           description: |
             The analysis did not finish within this request's budget. The
@@ -250,74 +276,183 @@ paths:
     get:
       operationId: getAllResults
       tags: [URL checks]
-      summary: List stored assessments, newest stored first
+      summary: Version-aware ruleset sync
       description: |
-        Reads stored assessments from MongoDB, ordered by their last
-        update time (newest first) — a record that just obtained its final
-        result sorts near the top. No provider request is made, no analysis
-        is started, and no field is derived from anything other than what the
-        provider previously returned.
+        Delivers the published URL ruleset as a whole — never a page of it,
+        never a truncation. The 200 body is a bare JSON array of dynamic
+        declarativeNetRequest rules, in exactly the shape a browser
+        extension passes to `updateDynamicRules`; it carries no success
+        envelope of its own.
+
+        The client sends the ruleset version it currently installed as the
+        `version` query parameter. The authoritative published version lives
+        in MongoDB (it survives restarts; the process holds no copy). Three
+        cases:
+
+        - **`version` absent** — a first-time client. The response carries
+          `X-Ruleset-Version` (the authoritative version) and
+          `X-Ruleset-Updated` `"true"`; the body is the complete current
+          ruleset.
+        - **`version` equals the published version** — the ruleset is up to
+          date. Body `[]` and `X-Ruleset-Updated` `"false"`; the URL
+          collection is not loaded or serialized for this case.
+        - **`version` differs** — the same complete body with
+          `X-Ruleset-Updated` `"true"`, regardless of which way the versions
+          differ.
+
+        ## What is published, and when the version changes
+
+        A stored assessment is published as a rule only when it is
+        provider-confirmed (`finished: true`), its verdict is
+        `malicious` or `suspicious`, and its result is still inside the
+        freshness window (`ASSESSMENT_TTL`, default 24h). Pending,
+        inconclusive, unknown and failed assessments are never published —
+        nothing unconfirmed ever becomes a rule.
+
+        The version is content-addressed: the backend fingerprints the
+        published set (URLs and their verdicts, stable ordering) and moves
+        the version forward only when that fingerprint changes — when a URL
+        becomes eligible, loses eligibility, or its published verdict
+        changes. Calls to this endpoint never change the version, and
+        neither do repeated scans that resolve to identical published
+        content.
+
+        ## Rule shape
+
+        Every rule says the same thing; only the matched URL differs.
+        `action.type` is always `block`, `priority` is always 1, and `id`
+        counts the published order 1..N — deterministic, so a client can
+        replace its whole dynamic ruleset in one `updateDynamicRules` call
+        (remove the previous ids, add these). The condition is:
+
+        - `urlFilter` — the assessed URL in adblock form: the host, a
+          separator (`^`), the verbatim path and query, closed with `|`
+          (`||host^/path|`); a bare host (a root URL) simplifies to
+          `||host^`. The host is case-folded; the scheme is dropped, so
+          http and https behave alike. `||` additionally matches subdomains
+          of the flagged host — that widening is part of the urlFilter
+          format and applies to every published URL.
+        - `resourceTypes` — the constant list
+          `[main_frame, sub_frame, script, xmlhttprequest, ping, websocket, webtransport]`.
+        - `isUrlFilterCaseSensitive` — always `true`; the pattern applies
+          exactly as delivered.
+
+        ## Determinism
+
+        Rules are ordered by URL (ascending) with at most one rule per URL,
+        so equal requests produce byte-identical responses. The version in
+        the headers and the body always belong to the same published
+        snapshot; if the stored snapshot cannot be reproduced
+        consistently, the endpoint answers with an error instead of a
+        mixed body.
+
+        Pagination is not supported: `page` and `limit` are not read, and
+        unknown query parameters other than `version` are ignored by the
+        client contract (send only `version`).
       parameters:
-        - name: page
+        - name: version
           in: query
-          description: 1-based page number.
+          description: |
+            The client's currently installed ruleset version. Optional:
+            omitting it requests the complete ruleset (first-time client).
+          required: false
           schema:
             type: integer
-            minimum: 1
-            maximum: 1000000
-            default: 1
-        - name: limit
-          in: query
-          description: Page size.
-          schema:
-            type: integer
-            minimum: 1
-            maximum: 100
-            default: 20
+            description: Canonical non-negative decimal integer — digits
+              only, no sign, no leading zeros ("0" itself is valid), at most
+              18 digits.
+            example: 3
       responses:
         '200':
-          description: One page of stored assessments, newest first. The body's
-            `data` is `[]` for an empty collection.
+          description: |
+            The ruleset answer. A bare array of published
+            declarativeNetRequest rules — empty when the sent version
+            matches the published one; the complete ruleset otherwise
+            (including an absent version). Which case applies is readable
+            from the synchronization headers without parsing the body.
+          headers:
+            X-Ruleset-Version:
+              description: >
+                The authoritative published version from MongoDB.
+              required: true
+              schema:
+                type: integer
+                format: int64
+                example: 3
+            X-Ruleset-Updated:
+              description: >
+                "false" only when the sent version matched the published
+                one (the body is [] then); "true" whenever the complete
+                ruleset is the body.
+              required: true
+              schema:
+                type: boolean
+                example: true
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/GetAllResponse'
+                type: array
+                description: The version in the headers and this array always
+                  belong to the same published snapshot. Empty rulesets and
+                  up-to-date clients receive [], never null.
+                items:
+                  $ref: '#/components/schemas/DNRRule'
               examples:
-                oneItem:
-                  summary: A collection with one stored result
+                updated:
+                  summary: The client's version differs; the full ruleset
+                  description: >
+                    Response to GET /api/v1/get-all?version=2 — the
+                    installed version 2 is older than the published
+                    version 3.
                   value:
-                    success: true
-                    data:
-                      - id: 6f3b1c9a2d4e5f60718293a4
-                        url: https://example.com
-                        provider: hybrid-analysis
-                        providerId: qs-9d6f2c81-4f2a-4a1e-a3d2-7cb1e08f5a10
-                        sha256: 1db1b0b12b19c8cebb75e19c1e4b6d9ad1e0a29f0e27a419e0f4f0efb1f2e0e1
-                        scanType: all
-                        status: completed
-                        finished: true
-                        scannersV2:
-                          bfore_ai:
-                            status: no specific threat
-                            progress: 100
-                        verdict: no_threat_detected
-                        createdAt: '2026-10-17T10:00:00Z'
-                        updatedAt: '2026-10-17T10:00:00Z'
-                    pagination:
-                      page: 1
-                      limit: 20
-                      total: 1
-                      totalPages: 1
-                empty:
-                  summary: Nothing stored yet
+                    - id: 1
+                      priority: 1
+                      action:
+                        type: block
+                      condition:
+                        urlFilter: '||malicious.example^/download|'
+                        resourceTypes:
+                          - main_frame
+                          - sub_frame
+                          - script
+                          - xmlhttprequest
+                          - ping
+                          - websocket
+                          - webtransport
+                        isUrlFilterCaseSensitive: true
+                firstTime:
+                  summary: No version sent — a first-time client
+                  description: >
+                    Response to GET /api/v1/get-all. The body equals the
+                    "updated" case with X-Ruleset-Updated "true".
                   value:
-                    success: true
-                    data: []
-                    pagination:
-                      page: 1
-                      limit: 20
-                      total: 0
-                      totalPages: 0
+                    - id: 1
+                      priority: 1
+                      action:
+                        type: block
+                      condition:
+                        urlFilter: '||malicious.example^'
+                        resourceTypes:
+                          - main_frame
+                          - sub_frame
+                          - script
+                          - xmlhttprequest
+                          - ping
+                          - websocket
+                          - webtransport
+                        isUrlFilterCaseSensitive: true
+                upToDate:
+                  summary: The client's version matches the published one
+                  description: >
+                    Response to GET /api/v1/get-all?version=3 —
+                    X-Ruleset-Updated "false", the body is empty.
+                  value: []
+                emptyRuleset:
+                  summary: Nothing is currently publishable
+                  description: >
+                    A first read over an empty (or fully clean) store still
+                    publishes version 1 with an empty ruleset.
+                  value: []
         '400':
           $ref: '#/components/responses/BadRequest'
         '405':
@@ -412,19 +547,69 @@ components:
         data:
           $ref: '#/components/schemas/SubmissionItem'
 
-    GetAllResponse:
+    DNRRule:
       type: object
-      required: [success, data, pagination]
+      description: >
+        One dynamic declarativeNetRequest rule, delivered verbatim for
+        `updateDynamicRules` — the client maps nothing. Both published
+        verdicts (malicious and suspicious) produce exactly this shape: a
+        block with priority 1.
+      required: [priority, action, condition]
       properties:
-        success:
-          type: boolean
-          example: true
-        data:
-          type: array
-          items:
-            $ref: '#/components/schemas/SubmissionItem'
-        pagination:
-          $ref: '#/components/schemas/Pagination'
+        id:
+          type: integer
+          format: int64
+          description: >
+            1..N over the published order, so a wholesale ruleset
+            replacement works: remove the previous ids and add these. A
+            rule delivered for a single URL (check-url's `data.rule`)
+            omits the id entirely — the client assigns one when installing
+            it dynamically.
+          example: 1
+        priority:
+          type: integer
+          description: Always 1 for published rules.
+          example: 1
+        action:
+          type: object
+          description: Always "block" — a classified-threat URL carries no
+            other action.
+          properties:
+            type:
+              type: string
+              enum: [block]
+              example: block
+        condition:
+          type: object
+          description: The URL match condition.
+          properties:
+            urlFilter:
+              type: string
+              description: >
+                The assessed URL in adblock form: the host, then a
+                separator (^), then the verbatim path and query, closed
+                with | (`||host^/path|`); a bare host (a root URL)
+                simplifies to `||host^`. The host is case-folded and the
+                scheme is dropped, so http and https behave alike.
+                urlFilter has no literal escape for pattern characters, so
+                a stored path keeping those characters verbatim could
+                widen the match; canonical submissions never contain them.
+              example: '||malicious.example^/download|'
+            resourceTypes:
+              type: array
+              description: The constant request-type list every published
+                rule covers.
+              items:
+                type: string
+                enum: [main_frame, sub_frame, script, xmlhttprequest, ping,
+                  websocket, webtransport]
+              example: [main_frame, sub_frame, script, xmlhttprequest, ping,
+                websocket, webtransport]
+            isUrlFilterCaseSensitive:
+              type: boolean
+              description: Always true — the pattern applies exactly as
+                delivered.
+              example: true
 
     SubmissionItem:
       type: object
@@ -531,9 +716,19 @@ components:
         updatedAt:
           type: string
           format: date-time
-          description: When the record was last written (UTC); get-all sorts
-            on this.
+          description: When the record was last written (UTC). A record whose
+            last write moves outside the freshness window (`ASSESSMENT_TTL`)
+            is re-assessed on the next check-url call and is no longer
+            published as a rule.
           example: '2026-10-17T10:00:00Z'
+        rule:
+          description: >
+            Present only for a confirmed threat (verdict malicious or
+            suspicious): the single declarativeNetRequest rule for this
+            URL, identical to what the get-all ruleset delivers — with the
+            one difference that it carries no id (the extension assigns
+            one when installing it dynamically). Absent otherwise.
+          $ref: '#/components/schemas/DNRRule'
 
     Scanner:
       type: object
@@ -587,27 +782,6 @@ components:
         threatFound:
           type: string
 
-    Pagination:
-      type: object
-      required: [page, limit, total, totalPages]
-      properties:
-        page:
-          type: integer
-          example: 1
-        limit:
-          type: integer
-          example: 20
-        total:
-          type: integer
-          format: int64
-          description: Total stored assessments across all pages.
-          example: 1
-        totalPages:
-          type: integer
-          format: int64
-          description: Zero when the collection is empty.
-          example: 1
-
     ErrorResponse:
       type: object
       required: [success, message, error]
@@ -636,7 +810,7 @@ components:
   responses:
     BadRequest:
       description: Malformed JSON body, unknown fields, unsupported content
-        type, or invalid pagination parameters.
+        type, or an invalid `version` parameter.
       content:
         application/json:
           schema:
@@ -649,10 +823,11 @@ components:
                 error:
                   code: invalid_request
                   status: 400
-            badPagination:
+            badVersion:
               value:
                 success: false
-                message: limit must be at most 100
+                message: version must be a non-negative integer (decimal digits
+                  only, no sign, no leading zeros, at most 18 digits)
                 error:
                   code: invalid_request
                   status: 400

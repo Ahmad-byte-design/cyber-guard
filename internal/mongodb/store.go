@@ -12,27 +12,38 @@ import (
 	"cyberguard/internal/models"
 )
 
-// Store is the persistence layer for URL assessments.
+// Store is the persistence layer for URL assessments and the published
+// ruleset version.
 //
-// One collection. Three query patterns, each backed by an index created in
+// Two collections. The submission queries are backed by indexes created in
 // EnsureIndexes:
 //
 //   - cache lookup by canonical URL (urlHash) — the check-url fast path;
 //   - one writable record per canonical URL (unique partial index), so
 //     concurrent equivalent requests converge on one provider submission;
-//   - get-all, newest first by updatedAt, so a record that just obtained its
-//     final result sorts near the top.
+//   - the ruleset publish/eligibility query, which reads completed records
+//     with a published verdict inside the freshness window.
+//
+// The ruleset version itself lives in its own collection as exactly one
+// document (models.RulesetCollection, _id models.RulesetStateID); every
+// version change goes through one atomic FindOneAndUpdate, so concurrent
+// finalizations can only bump the version, never corrupt it.
 //
 // Completed results are protected by every write path here: an update that
 // would move a record backward — pending data over a finished assessment —
 // simply does not match and reports `matched: false`.
 type Store struct {
-	coll *mongo.Collection
+	coll    *mongo.Collection
+	ruleset *mongo.Collection
 }
 
-// NewStore builds a Store over one collection of a connected database.
+// NewStore builds a Store over one submission collection plus the published
+// ruleset collection of a connected database.
 func NewStore(db *mongo.Database, name string) *Store {
-	return &Store{coll: db.Collection(name)}
+	return &Store{
+		coll:    db.Collection(name),
+		ruleset: db.Collection(models.RulesetCollection),
+	}
 }
 
 // EnsureIndexes creates the indexes the queries here rely on. It is
@@ -40,7 +51,7 @@ func NewStore(db *mongo.Database, name string) *Store {
 func (s *Store) EnsureIndexes(ctx context.Context) error {
 	for _, model := range []mongo.IndexModel{
 		{
-			// get-all sorts on every call.
+			// Newest-first reads (legacy records, operational inspection).
 			Keys:    bson.D{{Key: "updatedAt", Value: -1}},
 			Options: options.Index().SetName("by_updated_at"),
 		},
@@ -51,6 +62,16 @@ func (s *Store) EnsureIndexes(ctx context.Context) error {
 			Keys: bson.D{{Key: "urlHash", Value: 1}},
 			Options: options.Index().SetName("uniq_url_hash").SetUnique(true).
 				SetPartialFilterExpression(bson.M{"urlHash": bson.M{"$exists": true}}),
+		},
+		{
+			// The ruleset eligibility query: equality on status and
+			// verdict, then the freshness cutoff on updatedAt.
+			Keys: bson.D{
+				{Key: "status", Value: 1},
+				{Key: "verdict", Value: 1},
+				{Key: "updatedAt", Value: -1},
+			},
+			Options: options.Index().SetName("ruleset_snapshot"),
 		},
 	} {
 		if _, err := s.coll.Indexes().CreateOne(ctx, model); err != nil {
@@ -206,35 +227,109 @@ func (s *Store) ResetForRescan(ctx context.Context, id bson.ObjectID, expiredBef
 	return res.MatchedCount == 1, nil
 }
 
-// ListSubmissions returns one page of assessments, newest first by updatedAt,
-// and the total count of stored assessments.
-//
-// An empty collection returns an empty slice and a zero total; that is a
-// normal result, not an error.
-func (s *Store) ListSubmissions(ctx context.Context, page, limit int) ([]models.Submission, int64, error) {
-	total, err := s.coll.CountDocuments(ctx, bson.D{})
-	if err != nil {
-		return nil, 0, fmt.Errorf("mongodb: count submissions: %w", err)
+// RulesetState reads the single published-version document. found is false
+// when no version has ever been published — the first-run case the service
+// initializes from the current data.
+func (s *Store) RulesetState(ctx context.Context) (*models.RulesetState, bool, error) {
+	var state models.RulesetState
+	err := s.ruleset.FindOne(ctx, bson.M{"_id": models.RulesetStateID}).Decode(&state)
+	switch {
+	case err == nil:
+		return &state, true, nil
+	case err == mongo.ErrNoDocuments:
+		return nil, false, nil
+	default:
+		return nil, false, fmt.Errorf("mongodb: read ruleset state: %w", err)
 	}
+}
 
-	skip := int64(page-1) * int64(limit)
-	findOpts := options.Find().
-		// Newest first. The by_updated_at index serves this sort.
-		SetSort(bson.D{{Key: "updatedAt", Value: -1}}).
-		SetSkip(skip).
-		SetLimit(int64(limit))
-
-	cursor, err := s.coll.Find(ctx, bson.D{}, findOpts)
+// RulesetEntries returns the records eligible for the published ruleset:
+// completed, with a published verdict (models.PublishedVerdicts) and still
+// inside the freshness window (updatedAt not before cutoff).
+//
+// The rows are ordered deterministically — URL ascending, updatedAt
+// descending — so equal URLs are adjacent with the freshest record first and
+// the caller's digest over a customer's view of them is stable. The list is
+// deliberately unlimited: the ruleset endpoint must be able to return every
+// eligible URL, never a silently truncated cut. An empty ruleset is an empty
+// slice, not nil.
+func (s *Store) RulesetEntries(ctx context.Context, cutoff time.Time) ([]models.RulesetEntry, error) {
+	filter := bson.M{
+		"status": models.StatusCompleted,
+		"verdict": bson.M{"$in": bson.A{
+			models.VerdictMalicious,
+			models.VerdictSuspicious,
+		}},
+		"updatedAt": bson.M{"$gte": cutoff},
+	}
+	cursor, err := s.coll.Find(ctx, filter, options.Find().
+		SetSort(bson.D{
+			{Key: "url", Value: 1},
+			{Key: "updatedAt", Value: -1},
+		}).
+		// Only the published fields leave the collection; internal record
+		// data (scanner blobs, provider ids, digests) is never loaded.
+		SetProjection(bson.M{"url": 1, "verdict": 1}))
 	if err != nil {
-		return nil, 0, fmt.Errorf("mongodb: list submissions: %w", err)
+		return nil, fmt.Errorf("mongodb: list published rules: %w", err)
 	}
 	defer cursor.Close(ctx)
 
-	var items = make([]models.Submission, 0)
-	if err := cursor.All(ctx, &items); err != nil {
-		return nil, 0, fmt.Errorf("mongodb: decode submissions: %w", err)
+	entries := make([]models.RulesetEntry, 0)
+	if err := cursor.All(ctx, &entries); err != nil {
+		return nil, fmt.Errorf("mongodb: decode published rules: %w", err)
 	}
-	return items, total, nil
+	return entries, nil
+}
+
+// PublishRulesetState moves the authoritative version to digest — but only
+// when the stored digest differs, so a publish of unchanged content is a
+// no-op that leaves the version untouched.
+//
+// The change is one FindOneAndUpdate on the pinned document (upsert, so the
+// first-run case creates version 1): concurrent publishers serialize on the
+// document and each observed change bumps the version exactly once.
+//
+// bumped reports whether this call changed the version.
+func (s *Store) PublishRulesetState(ctx context.Context, digest string, now time.Time) (*models.RulesetState, bool, error) {
+	res := s.ruleset.FindOneAndUpdate(ctx,
+		bson.M{"_id": models.RulesetStateID, "digest": bson.M{"$ne": digest}},
+		bson.M{
+			"$inc": bson.M{"version": 1},
+			"$set": bson.M{"digest": digest, "updatedAt": now},
+		},
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After),
+	)
+	var state models.RulesetState
+	err := res.Decode(&state)
+	switch {
+	case err == nil:
+		return &state, true, nil
+	case err == mongo.ErrNoDocuments:
+		// The filter did not match: the stored digest already equals
+		// digest (nothing to change). Return the stored state untouched.
+		current, found, ferr := s.RulesetState(ctx)
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		if !found {
+			return nil, false, fmt.Errorf("mongodb: ruleset state vanished between reads")
+		}
+		return current, false, nil
+	case mongo.IsDuplicateKeyError(err):
+		// Two processes upserted the missing document at once; the other
+		// won. Its write is exactly the state this call wants to read.
+		current, found, ferr := s.RulesetState(ctx)
+		if ferr != nil {
+			return nil, false, ferr
+		}
+		if !found {
+			return nil, false, fmt.Errorf("mongodb: ruleset state vanished between reads")
+		}
+		return current, current.Digest != digest, nil
+	default:
+		return nil, false, fmt.Errorf("mongodb: publish ruleset version: %w", err)
+	}
 }
 
 // updateGuarded applies $set to one record, but only while it is not

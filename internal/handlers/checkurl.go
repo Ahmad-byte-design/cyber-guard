@@ -76,6 +76,11 @@ func (s *Server) handleCheckURL(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusAccepted
 		message = "Analysis is still in progress"
 	}
+	// The rule lets an extension install its block immediately, without
+	// waiting for the next get-all sync. Only a confirmed threat carries
+	// one (see services.DNRRuleFor); clean and pending responses have no
+	// rule field at all.
+	sub.Rule = services.DNRRuleFor(sub)
 	writeOK(w, status, message, sub)
 }
 

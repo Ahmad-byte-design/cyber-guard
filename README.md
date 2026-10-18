@@ -1,8 +1,8 @@
 # CyberGuard AI — backend
 
 A small Go REST API that checks a URL against Hybrid Analysis's quick-scan
-endpoint and reuses the stored result in MongoDB. Two endpoints, one
-collection, no queues, no workers. Everything runs in one process.
+endpoint and reuses the stored result in MongoDB. Two endpoints, no queues,
+no workers. Everything runs in one process.
 
 ```
 browser / curl
@@ -17,10 +17,12 @@ browser / curl
 │              │ ◀────────────────────── JSON ──  └────────────────────┘
 └──────┬───────┘
        │ normalized verdict stored atomically (one record per canonical URL)
+       │ final verdict ⇒ ruleset version reconciled (content-addressed)
        ▼
-   MongoDB ── one collection: url_submissions
+   MongoDB ── collections: url_submissions + ruleset_state (one version document)
        ▲
-       │  GET /api/v1/get-all  (page/limit, newest first)
+       │  GET /api/v1/get-all?version=N  (match ⇒ [] + headers; else the
+       │                                  complete declarativeNetRequest ruleset)
 ```
 
 ## Endpoints
@@ -28,7 +30,7 @@ browser / curl
 | Method | Path                 | Purpose                                                       | Success   |
 | ------ | -------------------- | ------------------------------------------------------------- | --------- |
 | POST   | `/api/v1/check-url`  | Check a URL: cache first, provider only when needed           | `200` or `202` |
-| GET    | `/api/v1/get-all`    | List stored assessments, newest stored first                  | `200`     |
+| GET    | `/api/v1/get-all`    | Version-aware ruleset sync (`?version=N`), bare declarativeNetRequest rules array | `200`     |
 | GET    | `/health/live`       | Liveness: is the process serving                              | `200`     |
 | GET    | `/health/ready`      | Readiness: process **and** MongoDB reachable                   | `200`     |
 | GET    | `/openapi.yaml`      | The OpenAPI 3 contract (byte-identical commit)                | `200`     |
@@ -139,13 +141,13 @@ Every variable is optional; sensible defaults fit `docker compose`.
 | -------------------------------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `APP_PORT`                       | `8080`                                   | HTTP port (host port under Compose; the container always listens on 8080)                       |
 | `MONGODB_URI`                    | `mongodb://localhost:27017`              | MongoDB connection string (Compose overrides to `mongodb://mongodb:27017`)                      |
-| `MONGODB_DATABASE`               | `cyberguard`                             | Database name (one collection: `url_submissions`)                                               |
+| `MONGODB_DATABASE`               | `cyberguard`                             | Database name (collections: `url_submissions`, `ruleset_state`)                                  |
 | `HYBRID_ANALYSIS_BASE_URL`       | `https://hybrid-analysis.com/api/v2`     | Provider base URL — see the "no www" note under Limitations                                     |
 | `HYBRID_ANALYSIS_API_KEY`        | *(empty)*                                | Hybrid Analysis API key. Without it check-url answers `503 provider_not_configured`             |
 | `HYBRID_ANALYSIS_TIMEOUT`        | `30s`                                    | Per-request provider budget (max `5m`); also bounds the whole check-url wait for a final result |
 | `HYBRID_ANALYSIS_SCAN_TYPE`      | `all`                                    | Optional: documented `scan_type` value, validated at startup against the provider's enum         |
 | `HYBRID_ANALYSIS_POLL_INTERVAL`  | `1s`                                     | Pause between result retrievals while one request waits (`> 0`, at most `1m`)                    |
-| `ASSESSMENT_TTL`                 | `24h`                                    | How long a completed assessment stays reusable as a cached result (`> 0`, at most `336h`)         |
+| `ASSESSMENT_TTL`                 | `24h`                                    | Cache lifetime of a completed assessment — and the freshness window for publishing a rule (`> 0`, at most `336h`) |
 | `CORS_ALLOWED_ORIGINS`           | `http://localhost:3000,http://localhost:5173` | Exact allowed origins, comma separated. `*` is rejected at startup                          |
 
 The key is read from the environment (or `.env`) and used **only** in the
@@ -196,30 +198,113 @@ request); `202` — still pending:
 - `verdict` is `null` while pending, otherwise one of the documented values
   above (`malicious`, `suspicious`, `no_threat_detected`, `inconclusive`,
   `unknown`), derived only from a `finished: true` provider response.
+- `rule` exists on confirmed threats only (`malicious`/`suspicious`): the
+  single embeddable declarativeNetRequest rule for that URL, identical to
+  the get-all ruleset shape but without an `id` — an extension assigns the
+  id itself and installs the rule immediately instead of waiting for the
+  next `get-all` sync. Clean and pending answers have no `rule` field.
 
 Calling the same URL twice costs at most one provider submission: the second
 call is answered from MongoDB until the cached assessment expires
 (`ASSESSMENT_TTL`), after which it is assessed again — in place.
 
-### List assessments — `curl`
+### Sync the ruleset — `curl`
+
+`GET /api/v1/get-all` is version-aware and returns the ruleset as a bare JSON
+array of dynamic **declarativeNetRequest rules**, in exactly the shape a
+browser extension passes to `updateDynamicRules`. Send the ruleset version
+your client currently installed as `?version=N`; a first-time client omits
+it. Version and up-to-date status ride in the `X-Ruleset-Version` and
+`X-Ruleset-Updated` headers — the body carries no envelope.
 
 ```sh
-curl -sS 'http://localhost:8080/api/v1/get-all?page=1&limit=20'
+curl -sS -i 'http://localhost:8080/api/v1/get-all?version=2'
+# X-Ruleset-Version: 3
+# X-Ruleset-Updated: true
 ```
+
+When the client's version matches the authoritative published version, the
+body is empty — the URL collection is not even read:
 
 ```json
-{
-  "success": true,
-  "data": [ { "…assessment as above…" } ],
-  "pagination": { "page": 1, "limit": 20, "total": 1, "totalPages": 1 }
-}
+[]
 ```
 
-`page` starts at 1 (max 1,000,000; out-of-range is `400`), `limit` defaults to
-20 and caps at 100. Unknown or malformed parameters are `400` with the common
-error shape — nothing is silently clamped. An empty result set returns
-`data: []`, never `null`. Records are sorted by their last update time, so a
-record that just obtained its final result sorts near the top.
+When the versions differ (or the version is absent), the complete current
+ruleset is delivered — every eligible stored URL, stable URL order,
+deterministic rule ids 1..N, no duplicates, no pagination and no silent
+truncation:
+
+```json
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "block"
+    },
+    "condition": {
+      "urlFilter": "||confirmed-malicious.example^/download|",
+      "resourceTypes": [
+        "main_frame",
+        "sub_frame",
+        "script",
+        "xmlhttprequest",
+        "ping",
+        "websocket",
+        "webtransport"
+      ],
+      "isUrlFilterCaseSensitive": true
+    }
+  }
+]
+```
+
+Both published verdicts (`malicious`, `suspicious`) produce exactly that
+block shape — see below for the `urlFilter` construction. If the fetched
+version was already installed, read `X-Ruleset-Updated` before replacing
+anything.
+
+`version` must be a plain non-negative integer (digits only, no sign, no
+leading zeros, at most 18 digits); anything else — negative, fractional,
+empty, or double params — is `400 invalid_request` with the common error
+shape. An empty ruleset is a valid response: version 1 with `[]`.
+
+### What is published, and when the version changes
+
+The **authoritative version** lives in a single MongoDB document
+(`ruleset_state`; the collection persists across restarts — the process
+holds no copy). A stored assessment becomes a published rule only when all
+of these hold:
+
+- the provider reported `finished: true` and the record is `completed`;
+- its verdict is `malicious` or `suspicious` — pending, `inconclusive`,
+  `unknown`, failed or verdict-less scans are never published, and nothing
+  unconfirmed ever becomes a rule;
+- its result is still inside the freshness window (`ASSESSMENT_TTL`, default
+  24h) — an expired rule drops out.
+
+The version is **content-addressed**: a SHA-256 fingerprint of the published
+set (URLs + verdicts, fixed ordering). The version moves exactly when that
+fingerprint changes — a URL becomes eligible, loses eligibility, or its
+published verdict changes. Publishing happens when a final verdict is stored
+by check-url; a `get-all` call never changes the version, and scans that
+resolve to identical published content bump nothing.
+
+Every rule says one thing — "block this URL" — with `priority` 1 and
+`condition` built from the stored URL: the host case-folded, a `^` separator,
+then the verbatim path and query closed with a `|` end anchor
+(`||host^/path|`); a bare host (a root URL) simplifies to `||host^`. The
+scheme is dropped, so http and https behave alike, and the constant
+`resourceTypes` list covers the request types above. Ids are 1..N over the
+stable URL order, so the wholesale replacement (`removeRules` previous ids,
+`addRules` the new array) is exactly reproducible.
+
+Version and body always come from the same published snapshot: if the stored
+snapshot digest cannot be reproduced from the live content, `get-all`
+reconciles the version (content-addressed, so it is capped at real content
+changes) and on persistent inconsistency answers `503` instead of serving a
+mixed body.
 
 ### From JavaScript
 
@@ -232,15 +317,31 @@ async function checkURL(url) {
   });
   const body = await res.json();
   if (!body.success) throw new Error(`${body.error.code}: ${body.message}`);
-  return body.data; // { id, status, verdict, scannersV2, ... }
+  // A confirmed threat carries data.rule — the same embeddable rule shape
+  // the ruleset uses, without an id: assign one yourself (e.g. a hash of
+  // the URL) and add it via updateDynamicRules immediately, without
+  // waiting for the next get-all sync.
+  return body.data; // { id, status, verdict, rule?, scannersV2, ... }
   // status === "pending" ⇒ try again later; the same call resumes it.
 }
 
-async function listSubmissions(page = 1, limit = 20) {
-  const res = await fetch(`/api/v1/get-all?page=${page}&limit=${limit}`);
-  const body = await res.json();
-  if (!body.success) throw new Error(`${body.error.code}: ${body.message}`);
-  return body; // { data: [...], pagination: {...} }
+let installedVersion = null; // remembered by the client (e.g. chrome.storage)
+
+async function syncRuleset() {
+  const query = installedVersion === null ? "" : `?version=${installedVersion}`;
+  const res = await fetch(`/api/v1/get-all${query}`);
+  if (!res.ok) {
+    const body = await res.json();
+    throw new Error(`${body.error.code}: ${body.message}`); // errors keep the envelope
+  }
+  installedVersion = Number(res.headers.get("X-Ruleset-Version"));
+  if (res.headers.get("X-Ruleset-Updated") === "false") return []; // up to date
+  const rules = await res.json(); // bare array; install verbatim
+  await chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: existingRuleIds(),
+    addRules: rules,
+  });
+  return rules;
 }
 ```
 
@@ -262,7 +363,7 @@ Every failure is one shape:
 
 | Code                      | HTTP | When                                                                 |
 | ------------------------- | ---- | -------------------------------------------------------------------- |
-| `invalid_request`          | 400  | Bad JSON, bad `page`/`limit` parameters                              |
+| `invalid_request`          | 400  | Bad JSON, or an invalid `version` parameter (malformed, negative, fractional, leading zeros, twice) |
 | `validation_error`         | 422  | URL parsed but rejected (empty, too long, unsupported scheme, no host, control chars) |
 | `provider_not_configured`  | 503  | No API key configured                                                |
 | `provider_auth_failed`     | 502  | Provider rejected the configured API key                             |
@@ -325,7 +426,8 @@ internal/config/       environment + .env parsing, validation, CORS
 internal/handlers/     HTTP layer: routing, envelopes, errors, 200/202, Swagger UI
 internal/services/     check-url orchestration, verdict normalization, error mapping
 internal/hybridanalysis/  the provider client (POST /quick-scan/url + GET /quick-scan/{id})
-internal/mongodb/      connection and the store: cache lookups, guarded writes, listing
+internal/mongodb/      connection and the store: cache lookups, guarded writes,
+                       ruleset snapshot reads and the version document
 internal/models/       the document/response shapes (single source of truth)
 internal/docs/assets/  vendored Swagger UI
 docs/openapi.yaml      the contract served at /openapi.yaml
@@ -355,6 +457,17 @@ docs/openapi.yaml      the contract served at /openapi.yaml
   the API process; across replicas the unique index keeps the store
   consistent (losers adopt the winner's record), but two replicas may both
   submit once on a cold URL. Never auto-retried.
+- **`urlFilter` widens beyond the exact URL.** The `||` anchor also matches
+  subdomains of a flagged host, and pattern characters appearing verbatim in
+  a stored path (`*`, `^`, `|`) have no literal escape in urlFilter — an
+  exotic path can therefore block slightly more than the exact assessed URL.
+  This is a property of the declarativeNetRequest filter format, not a
+  mapping bug; canonical submissions never contain such characters.
+- **Ruleset freshness is pull-based.** The published version only moves when
+  a final verdict is stored (or a full delivery reconciles drift); nothing
+  re-evaluates the TTL proactively. A rule that has just aged out stays
+  served to matching-version clients until the next publishing or full
+  delivery.
 - **No authentication or rate limiting on the API itself.** CORS restricts
   *which pages* can call, not *how often*. Behind a public load balancer add
   auth throttling before exposing check-url.

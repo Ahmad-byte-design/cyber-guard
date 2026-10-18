@@ -3,7 +3,7 @@
 // Route surface:
 //
 //	POST /api/v1/check-url   submit a URL to the provider's quick scan
-//	GET  /api/v1/get-all     read stored submissions, newest first
+//	GET  /api/v1/get-all     version-aware ruleset sync (?version=N)
 //	GET  /health/live        process liveness
 //	GET  /health/ready       readiness, including MongoDB
 //	GET  /docs/              Swagger UI

@@ -89,20 +89,27 @@ type memStore struct {
 	records []*models.Submission
 	idSeq   int
 
+	// published-version state, exactly as Mongo would keep it
+	ruleState *models.RulesetState
+
 	// injected failures
-	findErr   error
-	insertErr error
-	updateErr error
-	listErr   error
+	findErr    error
+	insertErr  error
+	updateErr  error
+	stateErr   error
+	entriesErr error
+	publishErr error
 
 	// counters and traces
-	inserts       int
-	adopts        []string
-	pendingSaves  int
-	finalSaves    int
-	resets        int
-	inserted      []models.Submission
-	duplicateSeen bool
+	inserts        int
+	adopts         []string
+	pendingSaves   int
+	finalSaves     int
+	resets         int
+	inserted       []models.Submission
+	duplicateSeen  bool
+	publishCount   int
+	publishDigests []string
 
 	// hook, when set, runs inside InsertSubmission before its normal flow;
 	// it may inject a peer write (then return a duplicate error) to emulate
@@ -294,28 +301,92 @@ func (m *memStore) ResetForRescan(ctx context.Context, id bson.ObjectID, expired
 	return true, nil
 }
 
-func (m *memStore) ListSubmissions(ctx context.Context, page, limit int) ([]models.Submission, int64, error) {
+func (m *memStore) RulesetState(ctx context.Context) (*models.RulesetState, bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.listErr != nil {
-		return nil, 0, m.listErr
+	if m.stateErr != nil {
+		return nil, false, m.stateErr
 	}
-	items := make([]models.Submission, 0, len(m.records))
-	for _, rec := range m.records {
-		items = append(items, *rec)
+	if m.ruleState == nil {
+		return nil, false, nil
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].UpdatedAt.After(items[j].UpdatedAt) })
-	total := int64(len(items))
+	clone := *m.ruleState
+	return &clone, true, nil
+}
 
-	skip := (page - 1) * limit
-	if skip >= len(items) {
-		return []models.Submission{}, total, nil
+// RulesetEntries mirrors the real store's query: the eligibility filter
+// (completed, published verdict, updatedAt inside the freshness window) and
+// the deterministic row order (URL ascending, updatedAt descending). It does
+// NOT deduplicate: multiple pre-hashing legacy rows may share a URL, and the
+// service's deterministic fold must deal with that.
+func (m *memStore) RulesetEntries(ctx context.Context, cutoff time.Time) ([]models.RulesetEntry, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.entriesErr != nil {
+		return nil, m.entriesErr
 	}
-	end := skip + limit
-	if end > len(items) {
-		end = len(items)
+
+	// Sort the underlying records exactly as Mongo would (url asc, then
+	// updatedAt desc — freshest first), and project afterwards. This keeps
+	// the deduplication the service applies deterministic.
+	type row struct {
+		updated time.Time
+		sub     *models.Submission
 	}
-	return items[skip:end:end], total, nil
+
+	eligible := make([]row, 0, len(m.records))
+	for _, rec := range m.records {
+		if !rec.IsCompleted() || rec.Verdict == nil || !publishedVerdict(*rec.Verdict) {
+			continue
+		}
+		if rec.UpdatedAt.Before(cutoff) {
+			continue
+		}
+		eligible = append(eligible, row{updated: rec.UpdatedAt, sub: rec})
+	}
+	sort.Slice(eligible, func(i, j int) bool {
+		if eligible[i].sub.URL != eligible[j].sub.URL {
+			return eligible[i].sub.URL < eligible[j].sub.URL
+		}
+		return eligible[i].updated.After(eligible[j].updated)
+	})
+
+	entries := make([]models.RulesetEntry, 0, len(eligible))
+	for _, r := range eligible {
+		entries = append(entries, models.RulesetEntry{URL: r.sub.URL, Verdict: *r.sub.Verdict})
+	}
+	return entries, nil
+}
+
+// PublishRulesetState reproduces the store's content-addressed bump: a publish
+// of unchanged content is a no-op; a changed digest increments the version
+// exactly once; the first-ever publish creates version 1.
+func (m *memStore) PublishRulesetState(ctx context.Context, digest string, now time.Time) (*models.RulesetState, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.publishCount++
+	m.publishDigests = append(m.publishDigests, digest)
+	if m.publishErr != nil {
+		return nil, false, m.publishErr
+	}
+	if m.ruleState == nil {
+		m.ruleState = &models.RulesetState{ID: models.RulesetStateID, Version: 1, Digest: digest, UpdatedAt: now}
+		return m.cloneState(1), true, nil
+	}
+	if m.ruleState.Digest == digest {
+		clone := *m.ruleState
+		return &clone, false, nil
+	}
+	m.ruleState.Version++
+	m.ruleState.Digest = digest
+	m.ruleState.UpdatedAt = now
+	return m.cloneState(m.ruleState.Version), true, nil
+}
+
+func (m *memStore) cloneState(v int64) *models.RulesetState {
+	clone := *m.ruleState
+	clone.Version = v
+	return &clone
 }
 
 func (m *memStore) byID(id bson.ObjectID) *models.Submission {
@@ -360,6 +431,13 @@ func cleanFinishedResult(id string) hybridanalysis.Result {
 		ScannersV2: scannersV2(map[string]string{
 			"bfore_ai": "clean", "clean_dns": "clean", "scam_adviser": "clean",
 		}),
+	}
+}
+
+func maliciousFinishedResult(id string) hybridanalysis.Result {
+	return hybridanalysis.Result{
+		ID: id, SHA256: "evildigest", ScanType: "all", Finished: true,
+		ScannersV2: scannersV2(map[string]string{"metadefender": "malicious"}),
 	}
 }
 
@@ -1012,74 +1090,490 @@ func TestCheckURLNilScannersV2StaysAbsent(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// listing
+// version-aware ruleset listing
 // ---------------------------------------------------------------------------
 
-func TestList(t *testing.T) {
+// threatRecord seeds one completed record the publishing policy accepts.
+func threatRecord(url, verdict string, at time.Time) models.Submission {
+	v := verdict
+	return models.Submission{
+		URL: url, URLHash: canonicalURLHash(url),
+		Provider: models.ProviderName, ProviderID: "qs-" + url,
+		ScanType: "all",
+		Status:   models.StatusCompleted, Finished: true,
+		Verdict:   &v,
+		CreatedAt: at, UpdatedAt: at,
+	}
+}
+
+func TestRulesetListing(t *testing.T) {
 	fixed := time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)
-	newSub := func(i int) models.Submission {
-		return models.Submission{
-			URL: fmt.Sprintf("https://example.com/%d", i), Provider: models.ProviderName,
-			ScanType: "all", Status: models.StatusPending,
-			CreatedAt: fixed, UpdatedAt: fixed,
-		}
+
+	newSvc := func(store *memStore) *Service {
+		// A nil analyzer: listing never contacts the provider.
+		return New(store, nil, testOptions(time.Second, 10*time.Millisecond))
 	}
 
-	t.Run("clamps defaults and maxima", func(t *testing.T) {
+	t.Run("missing version delivers the complete published ruleset", func(t *testing.T) {
 		store := &memStore{}
-		store.seed(newSub(1))
-		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
+		// Eligible: one malicious, one suspicious. Ineligible: pending,
+		// clean, inconclusive, unknown and a verdict-less legacy record.
+		store.seed(threatRecord("https://threat-a.example", models.VerdictMalicious, fixed))
+		store.seed(threatRecord("https://threat-b.example", models.VerdictSuspicious, fixed))
+		store.seed(threatRecord("https://clean.example", models.VerdictNoThreat, fixed))
+		store.seed(threatRecord("https://grey.example", models.VerdictInconclusive, fixed))
+		store.seed(threatRecord("https://muted.example", models.VerdictUnknown, fixed))
+		store.seed(models.Submission{
+			URL: "https://pending.example", URLHash: canonicalURLHash("https://pending.example"),
+			Provider: models.ProviderName, ScanType: "all",
+			Status: models.StatusPending, CreatedAt: fixed, UpdatedAt: fixed,
+		})
 
-		_, pag, serr := svc.List(context.Background(), 0, 999)
+		view, serr := newSvc(store).List(context.Background(), nil)
 		if serr != nil {
 			t.Fatalf("List: %+v", serr)
 		}
-		if pag.Page != 1 || pag.Limit != MaxLimit {
-			t.Errorf("pagination = %+v", pag)
+		if !view.Updated {
+			t.Error("a first-time client must receive the full ruleset (updated=true)")
+		}
+		if view.Version != 1 {
+			t.Errorf("Version = %d, want 1 (the first published snapshot)", view.Version)
+		}
+		var got []string
+		for _, e := range view.Entries {
+			got = append(got, e.URL)
+		}
+		want := []string{"https://threat-a.example", "https://threat-b.example"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Errorf("entries = %v, want exactly %v in URL order (publishable threats only)", got, want)
 		}
 	})
 
-	t.Run("empty collection", func(t *testing.T) {
+	t.Run("matching version answers from the version document alone", func(t *testing.T) {
 		store := &memStore{}
-		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
+		store.seed(threatRecord("https://threat.example", models.VerdictMalicious, fixed))
+		svc := newSvc(store)
+		if _, serr := svc.List(context.Background(), nil); serr != nil {
+			t.Fatalf("initial List: %+v", serr)
+		}
 
-		items, pag, serr := svc.List(context.Background(), 1, 20)
+		// A broken entries read would fail a full delivery — proving the
+		// matched path never touches the URL collection.
+		store.mu.Lock()
+		store.entriesErr = errors.New("find: unready")
+		store.mu.Unlock()
+		v := int64(1)
+		view, serr := svc.List(context.Background(), &v)
+		if serr != nil {
+			t.Fatalf("matched List: %+v", serr)
+		}
+		if view.Updated || view.Version != 1 || len(view.Entries) != 0 {
+			t.Errorf("view = %+v, want an empty up-to-date answer at version 1", view)
+		}
+	})
+
+	t.Run("different version delivers the full current snapshot", func(t *testing.T) {
+		store := &memStore{}
+		store.seed(threatRecord("https://threat.example", models.VerdictMalicious, fixed))
+		svc := newSvc(store)
+		if _, serr := svc.List(context.Background(), nil); serr != nil {
+			t.Fatalf("initial List: %+v", serr)
+		}
+
+		for _, stale := range []int64{0, 2, 5, 12345} {
+			view, serr := svc.List(context.Background(), &[]int64{stale}[0])
+			if serr != nil {
+				t.Fatalf("List(%d): %+v", stale, serr)
+			}
+			if !view.Updated || view.Version != 1 {
+				t.Errorf("List(%d) = (%v, version %d)", stale, view.Updated, view.Version)
+			}
+			if len(view.Entries) != 1 || view.Entries[0].URL != "https://threat.example" {
+				t.Errorf("List(%d) entries = %+v", stale, view.Entries)
+			}
+		}
+	})
+
+	t.Run("empty ruleset is a valid versioned response", func(t *testing.T) {
+		store := &memStore{}
+		svc := newSvc(store)
+
+		// First-time client: version 1, empty data — a real (empty)
+		// published snapshot, not an error.
+		view, serr := svc.List(context.Background(), nil)
 		if serr != nil {
 			t.Fatalf("List: %+v", serr)
 		}
-		if len(items) != 0 {
-			t.Errorf("items = %d", len(items))
+		if view.Version != 1 || !view.Updated || len(view.Entries) != 0 {
+			t.Errorf("empty ruleset = (%d, %v, %d entries)", view.Version, view.Updated, len(view.Entries))
 		}
-		if pag.Total != 0 || pag.TotalPages != 0 {
-			t.Errorf("pagination = %+v; an empty collection has zero pages", pag)
+
+		// A matching client on the empty snapshot: still tiny and exact.
+		one := int64(1)
+		view, serr = svc.List(context.Background(), &one)
+		if serr != nil {
+			t.Fatalf("List(1): %+v", serr)
+		}
+		if view.Updated || view.Version != 1 || len(view.Entries) != 0 {
+			t.Errorf("matched empty snapshot = (%v, %d, %d entries)", view.Updated, view.Version, len(view.Entries))
 		}
 	})
 
-	t.Run("pagination math", func(t *testing.T) {
+	t.Run("listing never changes the version", func(t *testing.T) {
 		store := &memStore{}
-		store.seed(newSub(1))
-		store.seed(newSub(2))
-		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
+		store.seed(threatRecord("https://threat.example", models.VerdictMalicious, fixed))
+		svc := newSvc(store)
+		if _, serr := svc.List(context.Background(), nil); serr != nil {
+			t.Fatalf("initial List: %+v", serr)
+		}
+		store.mu.Lock()
+		publishes := store.publishCount
+		store.mu.Unlock()
 
-		items, pag, serr := svc.List(context.Background(), 2, 1)
+		for range 5 {
+			if _, serr := svc.List(context.Background(), nil); serr != nil {
+				t.Fatalf("List: %+v", serr)
+			}
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if store.publishCount != publishes || store.ruleState.Version != 1 {
+			t.Errorf("get-all republished (%d vs %d) or bumped the version to %d",
+				store.publishCount, publishes, store.ruleState.Version)
+		}
+	})
+
+	t.Run("a missed publish reconciles without serving a mixed snapshot", func(t *testing.T) {
+		store := &memStore{}
+		store.seed(threatRecord("https://a.example", models.VerdictMalicious, fixed))
+		svc := newSvc(store)
+		if _, serr := svc.List(context.Background(), nil); serr != nil {
+			t.Fatalf("initial List: %+v", serr)
+		}
+
+		// Content changed behind the publisher's back (the stored digest
+		// is now stale). The stored state still claims the old digest,
+		// simulating a crash between a final save and its publish.
+		store.seed(threatRecord("https://b.example", models.VerdictSuspicious, fixed))
+
+		view, serr := svc.List(context.Background(), nil)
 		if serr != nil {
 			t.Fatalf("List: %+v", serr)
 		}
-		if len(items) != 1 {
-			t.Errorf("items = %d", len(items))
+		if view.Version != 2 {
+			t.Errorf("Version = %d, want 2 (the missing publish is reconciled)", view.Version)
 		}
-		if pag.Page != 2 || pag.Limit != 1 || pag.Total != 2 || pag.TotalPages != 2 {
-			t.Errorf("pagination = %+v", pag)
+		if !view.Updated || len(view.Entries) != 2 {
+			t.Errorf("view = %+v, want the complete reconciled snapshot", view)
 		}
 	})
 
-	t.Run("store failure", func(t *testing.T) {
-		store := &memStore{listErr: errors.New("find: connection closed")}
-		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
-
-		_, _, serr := svc.List(context.Background(), 1, 20)
+	t.Run("store failures are reported, never served as data", func(t *testing.T) {
+		store := &memStore{entriesErr: errors.New("find: closed")}
+		_, serr := newSvc(store).List(context.Background(), nil)
 		if serr == nil || serr.Code != CodeStoreUnavailable || serr.Status != 503 {
 			t.Fatalf("got %+v, want store_unavailable/503", serr)
+		}
+	})
+}
+
+// rulesetPublishing covers the content-addressed version changes the check-url
+// flow drives.
+func TestRulesetPublishing(t *testing.T) {
+	fixed := time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)
+
+	t.Run("a finalized verdict publishes through the check-url flow", func(t *testing.T) {
+		store := &memStore{}
+		analyzer := &fakeAnalyzer{
+			submitResult: hybridanalysis.Result{ID: "qs-77", ScanType: "all"},
+			getSeq: []hybridanalysis.Result{
+				unfinishedResult("qs-77"),
+				// The retrieval reply repeats this finished result, so
+				// the second URL below finishes on its first GET.
+				maliciousFinishedResult("qs-77"),
+			},
+		}
+		svc := New(store, analyzer, testOptions(5*time.Second, 20*time.Millisecond))
+
+		// First URL: submit, polls once (unfinished), then finishes.
+		// Pending progress saves happen on the way without publishing.
+		sub, serr := svc.CheckURL(context.Background(), "https://attack.example")
+		if serr != nil {
+			t.Fatalf("CheckURL: %+v", serr)
+		}
+		if !sub.IsCompleted() || sub.Verdict == nil || *sub.Verdict != models.VerdictMalicious {
+			t.Fatalf("finalized sub = %+v", sub)
+		}
+
+		view, serr := svc.List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("List: %+v", serr)
+		}
+		if view.Version != 1 || len(view.Entries) != 1 ||
+			view.Entries[0].URL != "https://attack.example" ||
+			view.Entries[0].Verdict != models.VerdictMalicious {
+			t.Fatalf("published = (%d, %+v), want the finalized malicious rule at version 1", view.Version, view.Entries)
+		}
+		store.mu.Lock()
+		publishes := store.publishCount
+		store.mu.Unlock()
+
+		// Second URL finalizes inside this request: the published
+		// content grows, and the version bumps — from the write that
+		// changed it, without any get-all reconcile.
+		if _, serr := svc.CheckURL(context.Background(), "https://attack-two.example"); serr != nil {
+			t.Fatalf("second CheckURL: %+v", serr)
+		}
+		view, serr = svc.List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("List: %+v", serr)
+		}
+		if view.Version != 2 || len(view.Entries) != 2 {
+			t.Fatalf("after second finalization = (%d, %d entries), want version 2 with 2 rules", view.Version, len(view.Entries))
+		}
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		if store.publishCount != publishes+1 {
+			t.Errorf("publishes = %d, want exactly the one content change (+%d); get-all published the rest",
+				store.publishCount, publishes)
+		}
+	})
+
+	t.Run("changed published content bumps the version exactly once", func(t *testing.T) {
+		store := &memStore{}
+		store.seed(threatRecord("https://a.example", models.VerdictMalicious, fixed))
+		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
+
+		_, serr := svc.List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("initial List: %+v", serr)
+		}
+
+		// A second URL becomes eligible: the published content changes.
+		store.seed(threatRecord("https://b.example", models.VerdictSuspicious, fixed))
+
+		view, serr := svc.List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("List: %+v", serr)
+		}
+		if view.Version != 2 {
+			t.Errorf("Version = %d, want 2", view.Version)
+		}
+		if len(view.Entries) != 2 {
+			t.Errorf("entries = %d, want 2", len(view.Entries))
+		}
+	})
+
+	t.Run("unchanged published content never bumps the version", func(t *testing.T) {
+		store := &memStore{}
+		store.seed(threatRecord("https://a.example", models.VerdictMalicious, fixed))
+		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
+		view, serr := svc.List(context.Background(), nil)
+		if serr != nil || view.Version != 1 {
+			t.Fatalf("initial List = (%d, %+v), want version 1", view.Version, serr)
+		}
+
+		// Touch the record (a rescan refreshing updatedAt) without
+		// changing the published content: same URL, same verdict. The
+		// version must not move.
+		touch := func() {
+			store.mu.Lock()
+			rec := store.byID(store.records[0].ID)
+			rec.UpdatedAt = fixed.Add(time.Minute)
+			store.mu.Unlock()
+		}
+		touch()
+		view, serr = svc.List(context.Background(), nil)
+		if serr != nil || view.Version != 1 || !view.Updated {
+			t.Fatalf("identical content = (%d, %+v), want version 1 unchanged", view.Version, serr)
+		}
+	})
+
+	t.Run("expired records leave the published snapshot", func(t *testing.T) {
+		store := &memStore{}
+		staleSeed := threatRecord("https://stale.example", models.VerdictMalicious, fixed)
+		staleSeed.UpdatedAt = fixed.Add(-48 * time.Hour)
+		store.seed(staleSeed)
+
+		// Default TTL 24h: the expired record is not publishable, so the
+		// very first snapshot is empty.
+		view, serr := New(store, nil, testOptions(time.Second, 10*time.Millisecond)).
+			List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("List: %+v", serr)
+		}
+		if len(view.Entries) != 0 || view.Version != 1 {
+			t.Errorf("expired-first ruleset = (%d entries, version %d)", len(view.Entries), view.Version)
+		}
+	})
+
+	t.Run("duplicate legacy rows for one URL yield one rule", func(t *testing.T) {
+		store := &memStore{}
+		// Two pre-hashing legacy records for the same canonical URL: no
+		// unique index conflicts (hash absent), and both hold a verdict.
+		a := threatRecord("https://dup.example", models.VerdictSuspicious, fixed)
+		a.URLHash = ""
+		b := threatRecord("https://dup.example", models.VerdictMalicious, fixed.Add(-time.Hour))
+		b.URLHash = ""
+		store.seed(b)
+		store.seed(a) // fresher row: its verdict must win deterministically
+
+		view, serr := New(store, nil, testOptions(time.Second, 10*time.Millisecond)).
+			List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("List: %+v", serr)
+		}
+		if len(view.Entries) != 1 {
+			t.Fatalf("entries = %+v, want one rule for the duplicated URL", view.Entries)
+		}
+		if view.Entries[0].Verdict != models.VerdictSuspicious {
+			t.Errorf("verdict = %q, want the freshest record's %q", view.Entries[0].Verdict, models.VerdictSuspicious)
+		}
+	})
+
+	t.Run("the version document survives a restart", func(t *testing.T) {
+		store := &memStore{}
+		store.seed(threatRecord("https://threat.example", models.VerdictMalicious, fixed))
+		svc := New(store, nil, testOptions(time.Second, 10*time.Millisecond))
+		if _, serr := svc.List(context.Background(), nil); serr != nil {
+			t.Fatalf("initial List: %+v", serr)
+		}
+
+		// A "restarted" process is a fresh service over the same store:
+		// the version must still be there, unchanged.
+		view, serr := New(store, nil, testOptions(time.Second, 10*time.Millisecond)).
+			List(context.Background(), nil)
+		if serr != nil {
+			t.Fatalf("List after restart: %+v", serr)
+		}
+		if view.Version != 1 {
+			t.Errorf("Version = %d after restart, want the persisted 1", view.Version)
+		}
+	})
+}
+
+// TestDNRRuleMapping pins the mapping from stored data onto the
+// extension-facing declarativeNetRequest shape. The ruleset body (get-all)
+// and the check-url data.rule are pure functions of the stored URL and
+// verdict, so pinning the helpers pins every presentation surface.
+func TestDNRRuleMapping(t *testing.T) {
+	t.Run("the urlFilter mirrors the stored URL", func(t *testing.T) {
+		cases := []struct {
+			raw  string
+			want string
+		}{
+			// Root URLs: host plus one separator — no end anchor.
+			{"https://example.com/", "||example.com^"},
+			{"https://example.com", "||example.com^"},
+			// Host + path, closed with the end anchor.
+			{"https://Example.COM/download", "||example.com^/download|"},
+			{"https://sub.host/path?q=v", "||sub.host^/path?q=v|"},
+			{"https://host:8443/p", "||host:8443^/p|"},
+			// A root URL with a query still pins its query.
+			{"https://host/?q=v", "||host^?q=v|"},
+			// Anything unparseable or host-less yields no filter at all.
+			{"not-a-url-at-all", ""},
+			{"%zz", ""},
+			{"mailto:someone@example.com", ""},
+		}
+		for _, tc := range cases {
+			if got := dnrURLFilter(tc.raw); got != tc.want {
+				t.Errorf("dnrURLFilter(%q) = %q, want %q", tc.raw, got, tc.want)
+			}
+		}
+	})
+
+	t.Run("the snapshot maps onto installable rules with ids 1..N", func(t *testing.T) {
+		view := &RulesetView{
+			Version: 3, Updated: true,
+			Entries: []models.RulesetEntry{
+				{URL: "https://a.example/", Verdict: models.VerdictMalicious},
+				{URL: "https://b.example/x", Verdict: models.VerdictSuspicious},
+			},
+		}
+		rules := RulesetRules(view)
+		if len(rules) != 2 {
+			t.Fatalf("rules = %d entries, want 2", len(rules))
+		}
+		for i, rule := range rules {
+			if rule.ID == nil || *rule.ID != int64(i+1) {
+				t.Errorf("rules[%d].id = %v, want %d", i, rule.ID, i+1)
+			}
+			if rule.Priority != 1 || rule.Action.Type != "block" {
+				t.Errorf("rules[%d] = %+v, want a priority-1 block rule", i, rule)
+			}
+			if !rule.Condition.IsURLFilterCaseSensitive ||
+				len(rule.Condition.ResourceTypes) != len(models.DNRResourceTypes) {
+				t.Errorf("rules[%d].condition = %+v, want the constant match condition", i, rule.Condition)
+			}
+		}
+		if got, want := rules[0].Condition.URLFilter, "||a.example^"; got != want {
+			t.Errorf("rules[0].urlFilter = %q, want %q", got, want)
+		}
+		if got, want := rules[1].Condition.URLFilter, "||b.example^/x|"; got != want {
+			t.Errorf("rules[1].urlFilter = %q, want %q", got, want)
+		}
+
+		// An empty snapshot is an empty (non-nil) JSON array, never null.
+		empty := RulesetRules(&RulesetView{Version: 1})
+		if empty == nil || len(empty) != 0 {
+			t.Errorf("empty snapshot = %v, want a non-nil empty slice", empty)
+		}
+	})
+
+	t.Run("corrupted entries are dropped instead of served over-broad", func(t *testing.T) {
+		view := &RulesetView{Entries: []models.RulesetEntry{
+			{URL: "https://good.example/", Verdict: models.VerdictMalicious},
+			{URL: "%zz", Verdict: models.VerdictMalicious},           // unparseable
+			{URL: "no-host-here", Verdict: models.VerdictSuspicious}, // hostless
+		}}
+		rules := RulesetRules(view)
+		if len(rules) != 1 || rules[0].Condition.URLFilter != "||good.example^" {
+			t.Errorf("rules = %+v, want exactly the healthy rule", rules)
+		}
+		if rules[0].ID == nil || *rules[0].ID != 1 {
+			t.Errorf("the delivered rule is renumbered over what is shipped, id %v", rules[0].ID)
+		}
+	})
+
+	t.Run("data.rule exists only for confirmed threats and carries no id", func(t *testing.T) {
+		malicious, suspicious, clean, unknown := models.VerdictMalicious, models.VerdictSuspicious,
+			models.VerdictNoThreat, models.VerdictUnknown
+		hostile := &models.Submission{
+			URL:    "https://hostile.example/download",
+			Status: models.StatusCompleted, Finished: true,
+			Verdict: &malicious,
+		}
+		rule := DNRRuleFor(hostile)
+		if rule == nil {
+			t.Fatal("a completed malicious assessment has no rule")
+		}
+		if rule.ID != nil {
+			t.Errorf("the single-URL rule carries an id %d; the client assigns one", *rule.ID)
+		}
+		if rule.Condition.URLFilter != "||hostile.example^/download|" {
+			t.Errorf("rule = %+v, want the exact-match filter", rule)
+		}
+
+		hostile.Verdict = &suspicious
+		if DNRRuleFor(hostile) == nil {
+			t.Error("a confirmed suspicious assessment must also get a rule")
+		}
+		hostile.Verdict = &clean
+		if DNRRuleFor(hostile) != nil {
+			t.Error("a clean assessment must not get a rule")
+		}
+		hostile.Verdict = &unknown
+		if DNRRuleFor(hostile) != nil {
+			t.Error("an unknown verdict must never become a rule")
+		}
+		hostile.Status = models.StatusPending
+		hostile.Verdict = &malicious
+		if DNRRuleFor(hostile) != nil {
+			t.Error("a pending record must not get a rule")
+		}
+		if DNRRuleFor(nil) != nil {
+			t.Error("nil input must not get a rule")
 		}
 	})
 }

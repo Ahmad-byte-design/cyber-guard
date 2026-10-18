@@ -1,5 +1,5 @@
 // Package services orchestrates the two API operations: checking a URL and
-// reading stored assessments back.
+// serving the published URL ruleset.
 //
 // CheckURL is a cache-first workflow:
 //
@@ -36,6 +36,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"reflect"
 	"strings"
@@ -50,19 +51,16 @@ import (
 	"cyberguard/internal/models"
 )
 
-// Validation, pagination and policy bounds.
+// Validation and policy bounds.
 const (
 	// MaxURLLength bounds a submitted URL. 2048 is a widely accepted de
 	// facto limit; longer input is rejected before anything is parsed.
 	MaxURLLength = 2048
-	// DefaultLimit and MaxLimit bound get-all's page size.
-	DefaultLimit = 20
-	MaxLimit     = 100
-	// MaxPage bounds the page parameter so a skip value can never overflow.
-	MaxPage = 1_000_000
 
 	// DefaultAssessmentTTL is how long a completed assessment may be served
-	// from MongoDB before a fresh provider check happens.
+	// from MongoDB before a fresh provider check happens. It also bounds the
+	// freshness window a record must be inside to be published in the
+	// ruleset.
 	DefaultAssessmentTTL = 24 * time.Hour
 	// DefaultPollInterval is the pause between result retrievals while one
 	// request waits for the provider to finish.
@@ -71,6 +69,11 @@ const (
 	// result before answering HTTP 202; server WriteTimeout adds a margin
 	// on top of it.
 	DefaultWaitBudget = 30 * time.Second
+
+	// reconcileAttempts bounds how often a get-all read re-checks the
+	// published snapshot against live content when the two disagree at
+	// first. The disagreement is never returned to the client.
+	reconcileAttempts = 3
 )
 
 // Error is a service-level failure with a stable code and HTTP status.
@@ -121,19 +124,29 @@ type SubmissionStore interface {
 	SavePendingProgress(ctx context.Context, id bson.ObjectID, stage *models.Submission) (bool, error)
 	SaveFinalResult(ctx context.Context, id bson.ObjectID, final *models.Submission) (bool, error)
 	ResetForRescan(ctx context.Context, id bson.ObjectID, expiredBefore time.Time, stage *models.Submission) (bool, error)
-	ListSubmissions(ctx context.Context, page, limit int) ([]models.Submission, int64, error)
+
+	// The published ruleset version: the authoritative document the
+	// get-all endpoint serves from.
+	RulesetState(ctx context.Context) (*models.RulesetState, bool, error)
+	RulesetEntries(ctx context.Context, cutoff time.Time) ([]models.RulesetEntry, error)
+	PublishRulesetState(ctx context.Context, digest string, now time.Time) (*models.RulesetState, bool, error)
 }
 
 // ServiceOptions carries the tunable policy values read from configuration.
 // Zero fields fall back to the documented defaults above.
 type ServiceOptions struct {
-	// AssessmentTTL is how long a completed assessment stays reusable.
+	// AssessmentTTL is how long a completed assessment stays reusable. The
+	// same window decides whether a completed record is still fresh enough
+	// to be published in the ruleset.
 	AssessmentTTL time.Duration
 	// PollInterval is the pause between result retrievals while waiting.
 	PollInterval time.Duration
 	// WaitBudget bounds the total wait for a finished result inside one
 	// request. Requests that run out of budget are answered 202 pending.
 	WaitBudget time.Duration
+	// Logger receives the service's own operational warnings (publish
+	// failures). Nil falls back to the process default logger.
+	Logger *slog.Logger
 }
 
 // Service wires one provider and one store together.
@@ -144,6 +157,7 @@ type Service struct {
 	assessmentTTL time.Duration
 	pollInterval  time.Duration
 	waitBudget    time.Duration
+	logger        *slog.Logger
 	inflight      inflightSet
 }
 
@@ -175,7 +189,16 @@ func New(store SubmissionStore, analyzer URLAnalyzer, opts ServiceOptions) *Serv
 		assessmentTTL: opts.AssessmentTTL,
 		pollInterval:  opts.PollInterval,
 		waitBudget:    opts.WaitBudget,
+		logger:        opts.Logger,
 	}
+}
+
+// loggerOrDefault keeps the nil logger usable in tests and wiring.
+func (s *Service) loggerOrDefault() *slog.Logger {
+	if s.logger == nil {
+		return slog.Default()
+	}
+	return s.logger
 }
 
 // CheckURL handles one URL check under the cache-first flow described in the
@@ -398,8 +421,12 @@ func (s *Service) submitAgain(ctx context.Context, rec *models.Submission, canon
 	if stage.Finished {
 		// The submission answered finished immediately; persist the final
 		// state now so the record never reads "pending" in between.
-		if _, ferr := s.store.SaveFinalResult(ctx, rec.ID, stage); ferr != nil {
+		matched, ferr := s.store.SaveFinalResult(ctx, rec.ID, stage)
+		if ferr != nil {
 			return nil, storeError(ferr)
+		}
+		if matched {
+			s.refreshRuleset(ctx)
 		}
 	}
 	return stage, nil
@@ -461,7 +488,13 @@ func (s *Service) waitForResult(ctx context.Context, rec *models.Submission, dea
 				if ferr != nil {
 					return nil, storeError(ferr)
 				}
-				if !matched {
+				if matched {
+					// A verdict was just stored for the first time: the
+					// published ruleset may have changed, so the version
+					// is reconciled now (content-addressed — an unchanged
+					// set bumps nothing).
+					s.refreshRuleset(ctx)
+				} else {
 					// Another request completed the record first; serve
 					// what is stored rather than overwriting it.
 					if stored, serr2 := s.findRecord(ctx, rec.URL, rec.URLHash); serr2 == nil && stored != nil {
@@ -561,31 +594,197 @@ func applyResult(stage *models.Submission, result hybridanalysis.Result) {
 	}
 }
 
-// List returns one page of stored assessments, newest first.
-func (s *Service) List(ctx context.Context, page, limit int) ([]models.Submission, models.Pagination, *Error) {
-	if page < 1 {
-		page = 1
-	}
-	if limit < 1 {
-		limit = DefaultLimit
-	}
-	if limit > MaxLimit {
-		limit = MaxLimit
-	}
-	if page > MaxPage {
-		page = MaxPage
-	}
+// RulesetView is the service-level answer of get-all: the authoritative
+// published version and — when the client's version differs — the complete
+// published ruleset.
+type RulesetView struct {
+	// Version is the authoritative published version from MongoDB.
+	Version int64
+	// Updated is false only when the client's version equals Version.
+	Updated bool
+	// Entries is the complete published ruleset when Updated is true, and
+	// an empty (never nil) slice when Updated is false: on an up-to-date
+	// client the URL collection is not read or serialized at all.
+	Entries []models.RulesetEntry
+}
 
-	items, total, err := s.store.ListSubmissions(ctx, page, limit)
+// List serves the version-aware published ruleset.
+//
+// clientVersion is the frontend's currently installed version, nil when the
+// client did not send one (a first-time client).
+//
+//   - The version is read from the single MongoDB version document; a version
+//     equal to clientVersion is answered from that one document alone — the
+//     URL collection is never loaded or serialized.
+//   - A first run (no version document yet) initializes it deterministically
+//     from the current data; the version is never reset by a restart.
+//   - Any other version (including none) delivers the complete published
+//     ruleset: every eligible record, stable order, no duplicates, and never
+//     more than the published snapshot's own content — the live content's
+//     digest is verified against the stored one before anything is served, so
+//     version and data always belong to the same published snapshot.
+//
+// get-all never changes the version on its own: publishing happens when a
+// final verdict is stored (content-addressed, so unchanged content bumps
+// nothing), and the reconcile inside this function runs only when the stored
+// digest disagrees with the live content — a state normal operation cannot
+// produce.
+func (s *Service) List(ctx context.Context, clientVersion *int64) (*RulesetView, *Error) {
+	state, found, err := s.store.RulesetState(ctx)
 	if err != nil {
-		return nil, models.Pagination{}, &Error{
-			Status:  503,
-			Code:    CodeStoreUnavailable,
-			Message: "stored results could not be read; please retry",
-			err:     err,
+		return nil, storeError(err)
+	}
+	if !found {
+		// First run: the finished assessments already on file form the
+		// initial snapshot. Publishing is content-addressed, so this
+		// creates version 1 exactly once and leaves restarts untouched.
+		if perr := s.publishCurrentSnapshot(ctx); perr != nil {
+			return nil, perr
+		}
+		state, found, err = s.store.RulesetState(ctx)
+		if err != nil {
+			return nil, storeError(err)
+		}
+		if !found {
+			return nil, &Error{
+				Status:  503,
+				Code:    CodeStoreUnavailable,
+				Message: "the ruleset snapshot could not be read consistently; please retry",
+			}
 		}
 	}
-	return items, models.NewPagination(page, limit, total), nil
+
+	// An up-to-date client is answered from the version document alone.
+	if clientVersion != nil && *clientVersion == state.Version {
+		return &RulesetView{
+			Version: state.Version,
+			Updated: false,
+			Entries: []models.RulesetEntry{},
+		}, nil
+	}
+
+	return s.publishedRulesetFor(ctx, *state)
+}
+
+// publishedRulesetFor reads the complete published ruleset and verifies it
+// against the stored snapshot digest before serving. Only a verified match
+// (version, digest, data all from one published snapshot) is served.
+func (s *Service) publishedRulesetFor(ctx context.Context, state models.RulesetState) (*RulesetView, *Error) {
+	for attempt := 0; attempt < reconcileAttempts; attempt++ {
+		entries, serr := s.publishedEntries(ctx)
+		if serr != nil {
+			return nil, serr
+		}
+		digest := rulesetDigest(entries)
+		if digest == state.Digest {
+			return &RulesetView{Version: state.Version, Updated: true, Entries: entries}, nil
+		}
+
+		// The stored digest does not describe the live content. First
+		// assume a concurrent publish finalized between the two reads:
+		fresh, found, ferr := s.store.RulesetState(ctx)
+		if ferr != nil {
+			return nil, storeError(ferr)
+		}
+		if found && fresh.Digest == digest {
+			return &RulesetView{Version: fresh.Version, Updated: true, Entries: entries}, nil
+		}
+
+		// Otherwise the content changed without a publish — manual
+		// database edits, or a crash between a final save and its
+		// publish. Reconcile the version to the real content once and
+		// re-verify; serving unverified mixtures is not an option.
+		if perr := s.publishCurrentSnapshot(ctx); perr != nil {
+			return nil, perr
+		}
+		reloaded, found, ferr := s.store.RulesetState(ctx)
+		if ferr != nil {
+			return nil, storeError(ferr)
+		}
+		if !found {
+			return nil, &Error{
+				Status:  503,
+				Code:    CodeStoreUnavailable,
+				Message: "the ruleset snapshot could not be read consistently; please retry",
+			}
+		}
+		state = *reloaded
+	}
+	return nil, &Error{
+		Status:  503,
+		Code:    CodeStoreUnavailable,
+		Message: "the ruleset snapshot could not be read consistently; please retry",
+	}
+}
+
+// refreshRuleset reconciles the published version after a final verdict was
+// stored. Failures are logged, never returned: the client's check succeeded,
+// and a missed publish self-heals on the next get-all read.
+func (s *Service) refreshRuleset(ctx context.Context) {
+	if serr := s.publishCurrentSnapshot(ctx); serr != nil {
+		cause := serr.err
+		if cause == nil {
+			cause = errors.New(serr.Code)
+		}
+		s.loggerOrDefault().WarnContext(ctx, "ruleset publish after final verdict failed",
+			slog.String("code", serr.Code),
+			slog.String("reason", cause.Error()),
+		)
+	}
+}
+
+// publishCurrentSnapshot computes the digest of the currently publishable
+// content and hands it to the store's content-addressed version bump.
+func (s *Service) publishCurrentSnapshot(ctx context.Context) *Error {
+	entries, serr := s.publishedEntries(ctx)
+	if serr != nil {
+		return serr
+	}
+	if _, _, err := s.store.PublishRulesetState(ctx, rulesetDigest(entries), s.now()); err != nil {
+		return storeError(err)
+	}
+	return nil
+}
+
+// publishedEntries reads the currently eligible records and folds them into
+// the deterministic published view: stable URL ordering, at most one entry
+// per URL.
+func (s *Service) publishedEntries(ctx context.Context) ([]models.RulesetEntry, *Error) {
+	cutoff := s.now().Add(-s.assessmentTTL)
+	raw, err := s.store.RulesetEntries(ctx, cutoff)
+	if err != nil {
+		return nil, storeError(err)
+	}
+
+	// Eligibility query order (URL ascending, updatedAt descending) makes
+	// deduplication deterministic: the freshest record of a URL comes
+	// first, so its verdict wins. Multiple rows per URL can exist only
+	// for pre-hashing legacy records; the unique index already prevents
+	// new ones.
+	entries := make([]models.RulesetEntry, 0, len(raw))
+	prev := ""
+	for i, entry := range raw {
+		if i > 0 && entry.URL == prev {
+			continue
+		}
+		prev = entry.URL
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
+// rulesetDigest fingerprints published content: the SHA-256 of the entries in
+// their published order. Two snapshots with equal digests hold equal content,
+// which is what makes "version changes only when content changes" checkable.
+func rulesetDigest(entries []models.RulesetEntry) string {
+	h := sha256.New()
+	for _, entry := range entries {
+		// A separator that cannot occur in a URL or a verdict keeps the
+		// encoding collision-free; the trailing newline keeps entries
+		// delimiter-separated even inside the hash stream.
+		fmt.Fprintf(h, "%s\x1f%s\n", entry.URL, entry.Verdict)
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // mapProviderError turns a provider error into a safe API error.
@@ -791,4 +990,127 @@ func (f *inflightSet) acquire(ctx context.Context, hash string, deadline time.Ti
 			return nil, false
 		}
 	}
+}
+
+// --- declarativeNetRequest mapping ---------------------------------------
+//
+// The published ruleset is served as a verbatim installable array of dynamic
+// declarativeNetRequest rules: a browser extension fetches get-all and
+// passes the body straight to updateDynamicRules. The mapping below is the
+// single derivation of that shape — for the whole published snapshot as
+// well as for the data.rule of a freshly assessed URL — and it is a pure
+// function of the stored URL and verdict, so equal published content always
+// produces equal rules.
+
+// dnrPriority is the priority of every published rule.
+const dnrPriority = 1
+
+// dnrActionBlock is the single action a published verdict produces.
+const dnrActionBlock = "block"
+
+// publishedVerdict reports whether v belongs to the published vocabulary.
+func publishedVerdict(v string) bool {
+	for _, wanted := range models.PublishedVerdicts {
+		if v == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+// RulesetRules maps a served snapshot onto the get-all body: one rule per
+// published entry, with ids 1..N over the entry order so ids are as
+// deterministic and content-addressed as the snapshot itself. The returned
+// slice is never nil — an empty published ruleset is JSON [].
+//
+// Extension substitution is wholesale: because ids cover the served list and
+// the list is the complete published set, a client replaces its entire
+// dynamic ruleset with one updateDynamicRules call (all previous ids are
+// removed, new ids 1..N are added).
+func RulesetRules(view *RulesetView) []models.DNRRule {
+	rules := make([]models.DNRRule, 0, len(view.Entries))
+	for i, entry := range view.Entries {
+		id := int64(i) + 1
+		rule := dnrRuleForEntry(entry.URL, &id)
+		if rule.Condition.URLFilter == "" {
+			// Defensive: hand-corrupted data must never be shipped as a
+			// rule whose condition lacks its URL filter — an otherwise
+			// unrestricted condition in declarativeNetRequest matches
+			// every request of the listed resource types.
+			continue
+		}
+		rules = append(rules, rule)
+	}
+	return rules
+}
+
+// DNRRuleFor derives the rule of a single stored assessment: the exact same
+// mapping the published ruleset applies. It is nil unless the assessment is
+// completed with a published verdict (malicious or suspicious). The rule
+// carries no id — a client installing it dynamically assigns one.
+func DNRRuleFor(sub *models.Submission) *models.DNRRule {
+	if sub == nil || !sub.IsCompleted() || sub.Verdict == nil ||
+		!publishedVerdict(*sub.Verdict) {
+		return nil
+	}
+	rule := dnrRuleForEntry(sub.URL, nil)
+	if rule.Condition.URLFilter == "" {
+		return nil
+	}
+	return &rule
+}
+
+// dnrRuleForEntry builds one rule from a stored URL. id is nil for the
+// single-URL rule (see DNRRuleFor).
+func dnrRuleForEntry(rawURL string, id *int64) models.DNRRule {
+	return models.DNRRule{
+		ID:       id,
+		Priority: dnrPriority,
+		Action:   models.DNRAction{Type: dnrActionBlock},
+		Condition: models.DNRCondition{
+			URLFilter: dnrURLFilter(rawURL),
+			// DNRResourceTypes is shared read-only data; every rule
+			// lists exactly it.
+			ResourceTypes:            models.DNRResourceTypes,
+			IsURLFilterCaseSensitive: true,
+		},
+	}
+}
+
+// dnrURLFilter renders a stored canonical URL as the exact-match
+// adblock-style urlFilter:
+//
+//	https://malicious.example/download → ||malicious.example^/download|
+//	https://example.com/               → ||example.com^
+//
+// The scheme is dropped: the || anchor scopes the match to the start of a
+// hostname, so http and https behave alike. Path and query are copied
+// verbatim and a trailing | pins the end of the URL. A root URL has nothing
+// else to pin, so it becomes its host plus one ^ separator — which in
+// urlFilter semantics means the host itself and anything following it.
+//
+// An unparseable URL yields "" so callers can drop the entry instead of
+// shipping a rule that matches more than the assessed URL. Pattern
+// characters such as * inside a path are copied verbatim (urlFilter has no
+// literal escape for them) and can widen the match; canonical submissions
+// never contain them.
+func dnrURLFilter(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return ""
+	}
+	filter := "||" + strings.ToLower(u.Host)
+	path := u.EscapedPath()
+	query := u.RawQuery
+	if path == "" || path == "/" {
+		if query != "" {
+			return filter + "^?" + query + "|"
+		}
+		return filter + "^"
+	}
+	filter += "^" + path
+	if query != "" {
+		filter += "?" + query
+	}
+	return filter + "|"
 }

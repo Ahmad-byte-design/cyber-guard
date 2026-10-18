@@ -17,10 +17,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
+	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
@@ -44,15 +47,18 @@ func TestStoreIntegration(t *testing.T) {
 	}
 
 	// --- empty collection ------------------------------------------------
-	items, total, err := store.ListSubmissions(ctx, 1, 10)
+	entries, err := store.RulesetEntries(ctx, time.Now().UTC())
 	if err != nil {
-		t.Fatalf("ListSubmissions (empty): %v", err)
+		t.Fatalf("RulesetEntries (empty): %v", err)
 	}
-	if items == nil {
-		t.Error("empty collection returned a nil slice, want an empty slice")
+	if entries == nil {
+		t.Error("empty ruleset returned a nil slice, want an empty slice")
 	}
-	if len(items) != 0 || total != 0 {
-		t.Errorf("empty collection: got len=%d total=%d, want 0/0", len(items), total)
+	if len(entries) != 0 {
+		t.Errorf("empty ruleset: got len=%d, want 0", len(entries))
+	}
+	if _, found, err := store.RulesetState(ctx); err != nil || found {
+		t.Fatalf("RulesetState on a fresh database = (found=%v, %v), want not found", found, err)
 	}
 
 	// --- insert several, staggered so newest-first is unambiguous ----------
@@ -253,70 +259,161 @@ func TestStoreIntegration(t *testing.T) {
 	if afterReset.IsCompleted() || afterReset.ProviderID != "qs-new" || afterReset.Verdict != nil {
 		t.Errorf("record after reset = %+v, want a pending record pointed at the new scan", afterReset)
 	}
-
-	// The reset happened in place: no second record for that canonical URL.
-	_, total, err = store.ListSubmissions(ctx, 1, 100)
-	if err != nil {
-		t.Fatalf("ListSubmissions count: %v", err)
+	if afterReset.ID != inserted[0].ID {
+		t.Errorf("the rescan created a second record: old id %s, current id %s", inserted[0].ID.Hex(), afterReset.ID.Hex())
 	}
-	if want := int64(len(inserted) + 1); total != want {
-		t.Errorf("records = %d, want %d (a rescan reset must not create a second record)", total, want)
+	// And the unique index still refuses a second record for that URL.
+	dup2 := &models.Submission{
+		URL: inserted[0].URL, URLHash: inserted[0].URLHash,
+		Provider: models.ProviderName, ScanType: "all", Status: models.StatusPending,
+	}
+	if err := store.InsertSubmission(ctx, dup2); !mongo.IsDuplicateKeyError(err) {
+		t.Errorf("second record for a reset URL: err = %v, want a duplicate-key error", err)
 	}
 }
 
-// TestStoreIntegrationListOrder checks that get-all orders by updatedAt,
-// which keeps a record that just obtained its final result near the top.
-func TestStoreIntegrationListOrder(t *testing.T) {
+// TestStoreIntegrationRuleset covers the version document end to end against
+// real MongoDB: the first-run publish, the content-addressed no-ops, version
+// persistence across a "restart" (a second Store instance over the same
+// database), and the deterministic eligibility query that backs get-all.
+func TestStoreIntegrationRuleset(t *testing.T) {
 	ctx, store := openTestDatabase(t)
 	if err := store.EnsureIndexes(ctx); err != nil {
 		t.Fatalf("EnsureIndexes: %v", err)
 	}
 
 	now := time.Now().UTC()
-	stamp := time.Now().UTC().Format("150405.000000000")
-	first := &models.Submission{
-		URL: "https://order.example/first-" + stamp, URLHash: storeHash("https://order.example/first-" + stamp),
-		Provider: models.ProviderName, ScanType: "all", Status: models.StatusPending,
-		CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
-	}
-	if err := store.InsertSubmission(ctx, first); err != nil {
-		t.Fatal(err)
-	}
-	second := &models.Submission{
-		URL: "https://order.example/second-" + stamp, URLHash: storeHash("https://order.example/second-" + stamp),
-		Provider: models.ProviderName, ScanType: "all", Status: models.StatusPending,
-		CreatedAt: now.Add(-2 * time.Hour), UpdatedAt: now.Add(-2 * time.Hour),
-	}
-	if err := store.InsertSubmission(ctx, second); err != nil {
-		t.Fatal(err)
+	stamp := time.Now().UTC().Format("150405_000000000")
+
+	// --- first run: an empty ruleset publishes version 1 ----------------
+	state, bumped, err := store.PublishRulesetState(ctx, rulesetDigestStub(nil), now)
+	if err != nil || !bumped || state.Version != 1 {
+		t.Fatalf("first publish = (version %d, bumped %v, %v), want version 1", state.Version, bumped, err)
 	}
 
-	// As stored: the newer createdAt (first) is head even though second's
-	// createdAt is older — updatedAt decides.
-	items, total, err := store.ListSubmissions(ctx, 1, 10)
-	if err != nil || total != 2 {
-		t.Fatalf("list = (%v, %d, %v)", items, total, err)
+	// --- unchanged content is a no-op ------------------------------------
+	state, bumped, err = store.PublishRulesetState(ctx, rulesetDigestStub(nil), now)
+	if err != nil || bumped {
+		t.Fatalf("no-op publish = (bumped %v, %v), want an untouched version", bumped, err)
 	}
-	if items[0].ID != first.ID {
-		t.Errorf("list head = %s, want %s (newest updatedAt first)", items[0].ID.Hex(), first.ID.Hex())
+	if state.Version != 1 {
+		t.Errorf("version after a publishing nothing = %d, want 1", state.Version)
 	}
 
-	// Progress the older record recently: it must surface to the top.
-	progress := &models.Submission{
-		ID: second.ID, URL: second.URL, URLHash: second.URLHash,
-		Provider: models.ProviderName, ProviderID: "qs-bump",
-		CreatedAt: second.CreatedAt, UpdatedAt: now,
+	// --- eligible records beat the eligibility query -----------------------
+	malicious := &models.Submission{
+		URL: "https://b-threat.ruleset-" + stamp, URLHash: storeHash("https://b-threat.ruleset-" + stamp),
+		Provider: models.ProviderName, ScanType: "all",
+		Status: models.StatusCompleted, Finished: true,
+		Verdict:   &[]string{models.VerdictMalicious}[0],
+		CreatedAt: now, UpdatedAt: now,
 	}
-	if matched, err := store.SavePendingProgress(ctx, second.ID, progress); err != nil || !matched {
-		t.Fatalf("SavePendingProgress = (%v, %v)", matched, err)
+	suspicious := &models.Submission{
+		URL: "https://a-threat.ruleset-" + stamp, URLHash: storeHash("https://a-threat.ruleset-" + stamp),
+		Provider: models.ProviderName, ScanType: "all",
+		Status: models.StatusCompleted, Finished: true,
+		Verdict:   &[]string{models.VerdictSuspicious}[0],
+		CreatedAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
 	}
-	items, _, err = store.ListSubmissions(ctx, 1, 10)
+	clean := &models.Submission{
+		URL: "https://clean.ruleset-" + stamp, URLHash: storeHash("https://clean.ruleset-" + stamp),
+		Provider: models.ProviderName, ScanType: "all",
+		Status: models.StatusCompleted, Finished: true,
+		Verdict: &[]string{models.VerdictNoThreat}[0],
+	}
+	pending := &models.Submission{
+		URL: "https://pending.ruleset-" + stamp, URLHash: storeHash("https://pending.ruleset-" + stamp),
+		Provider: models.ProviderName, ScanType: "all",
+		Status: models.StatusPending,
+	}
+	expired := &models.Submission{
+		URL: "https://expired.ruleset-" + stamp, URLHash: storeHash("https://expired.ruleset-" + stamp),
+		Provider: models.ProviderName, ScanType: "all",
+		Status: models.StatusCompleted, Finished: true,
+		Verdict: &[]string{models.VerdictMalicious}[0],
+	}
+	for _, sub := range []*models.Submission{suspicious, malicious, clean, pending, expired} {
+		if err := store.InsertSubmission(ctx, sub); err != nil {
+			t.Fatalf("InsertSubmission %s: %v", sub.URL, err)
+		}
+		// An ObjectID timestamp is embedded in the ID itself in the real
+		// database, so the stored updatedAt is what the query sees.
+	}
+	expiredID, ferr2 := store.FindByURLHash(ctx, expired.URLHash)
+	if ferr2 != nil || expiredID == nil {
+		t.Fatalf("expired record lookup: (%v, %v)", expiredID, ferr2)
+	}
+	twoDaysAgo := now.Add(-48 * time.Hour)
+	if _, err := store.coll.UpdateOne(ctx, bson.M{"_id": expiredID.ID},
+		bson.M{"$set": bson.M{"updatedAt": twoDaysAgo}}); err != nil {
+		t.Fatalf("aging the expired record: %v", err)
+	}
+
+	// The freshness window mirrors ASSESSMENT_TTL's default (24h): both
+	// threat records (~now) stay inside, the record aged to 48h ago falls
+	// out. (An exact `now` cutoff would be fragile: MongoDB truncates
+	// BSON datetimes to milliseconds.)
+	entries, err := store.RulesetEntries(ctx, now.Add(-24*time.Hour))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("RulesetEntries: %v", err)
 	}
-	if items[0].ID != second.ID {
-		t.Errorf("list head = %s, want the recently-updated record %s", items[0].ID.Hex(), second.ID.Hex())
+	if len(entries) != 2 {
+		t.Fatalf("entries = %+v, want exactly the two threat rules (noThreat, pending and expired excluded)", entries)
 	}
+	if entries[0].URL != suspicious.URL || entries[1].URL != malicious.URL {
+		t.Errorf("entries order = [%s %s], want URL-ascending [%s %s]",
+			entries[0].URL, entries[1].URL, suspicious.URL, malicious.URL)
+	}
+	for _, e := range entries {
+		if e.URL == "" || e.URL != suspicious.URL && e.URL != malicious.URL {
+			t.Fatalf("entry leaked internal fields: %+v", e)
+		}
+	}
+
+	// --- changed content bumps the version, unchanged content does not ---
+	digest := rulesetDigestStub(entries)
+	state, bumped, err = store.PublishRulesetState(ctx, digest, now)
+	if err != nil || !bumped || state.Version != 2 {
+		t.Fatalf("content publish = (version %d, bumped %v, %v), want version 2", state.Version, bumped, err)
+	}
+	state, bumped, err = store.PublishRulesetState(ctx, digest, now)
+	if err != nil || bumped || state.Version != 2 {
+		t.Fatalf("identical publish = (version %d, bumped %v, %v), want version 2 untouched", state.Version, bumped, err)
+	}
+
+	// --- the version survives a restart ---------------------------------
+	// A restarted process holds the version only through the data it reads:
+	// a fresh Store handle over the same server-side database must serve
+	// the exact same version document, untouched.
+	restarted := NewStore(store.coll.Database(), models.SubmissionCollection)
+	state, found, err := restarted.RulesetState(ctx)
+	if err != nil || !found {
+		t.Fatalf("RulesetState after restart = (found=%v, %v)", found, err)
+	}
+	if state.Version != 2 || state.Digest != digest {
+		t.Errorf("state after restart = (%d, %q), want (2, %q)", state.Version, state.Digest, digest)
+	}
+
+	// --- freshness: an old cutoff hides the entries ----------------------
+	entries, err = restarted.RulesetEntries(ctx, now.Add(time.Hour))
+	if err != nil {
+		t.Fatalf("RulesetEntries (future cutoff): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("entries past the freshness cutoff = %+v, want an empty ruleset", entries)
+	}
+}
+
+// rulesetDigestStub fingerprints ruleset rows the same way the service does
+// (url, then verdict, newline-terminated, in the queried order), so the test's
+// digests agree with a full snapshot of the same rows.
+func rulesetDigestStub(entries []models.RulesetEntry) string {
+	lines := make([]string, 0, len(entries))
+	for _, e := range entries {
+		lines = append(lines, fmt.Sprintf("%s\x1f%s\n", e.URL, e.Verdict))
+	}
+	digest := sha256.Sum256([]byte(strings.Join(lines, "")))
+	return hex.EncodeToString(digest[:])
 }
 
 func openTestDatabase(t *testing.T) (context.Context, *Store) {

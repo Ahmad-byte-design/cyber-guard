@@ -3,8 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"net/http"
-
-	"cyberguard/internal/models"
 )
 
 // Response envelope.
@@ -12,14 +10,14 @@ import (
 // Every endpoint answers in one of two shapes, so a client parses outcomes
 // uniformly:
 //
-//	{"success": true,  "message": "...", "data": ..., "pagination": {...}}
+//	{"success": true,  "message": "...", "data": ...}                (check-url)
+//	{"success": true,  "message", "version", "updated", "data"}      (get-all)
 //	{"success": false, "message": "...", "error": {"code": "...", "status": N}}
 
 type response struct {
-	Success    bool               `json:"success"`
-	Message    string             `json:"message,omitempty"`
-	Data       any                `json:"data,omitempty"`
-	Pagination *models.Pagination `json:"pagination,omitempty"`
+	Success bool   `json:"success"`
+	Message string `json:"message,omitempty"`
+	Data    any    `json:"data,omitempty"`
 }
 
 type errorDetail struct {
@@ -43,11 +41,6 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 // writeOK answers with a success envelope.
 func writeOK(w http.ResponseWriter, status int, message string, data any) {
 	writeJSON(w, status, response{Success: true, Message: message, Data: data})
-}
-
-// writeOKPaged answers with a success envelope carrying pagination metadata.
-func writeOKPaged(w http.ResponseWriter, status int, data any, pagination models.Pagination) {
-	writeJSON(w, status, response{Success: true, Data: data, Pagination: &pagination})
 }
 
 // writeError answers with the error envelope. The message is written for the

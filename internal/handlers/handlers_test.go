@@ -75,13 +75,19 @@ type fakeStore struct {
 	recs  []*models.Submission
 	idSeq int
 
+	ruleState *models.RulesetState
+
 	findErr   error
 	insertErr error
 	updateErr error
-	listErr   error
+	stateErr  error
 
-	items []models.Submission // canned list page
-	total int64
+	entriesErr error
+	entries    []models.RulesetEntry // canned ruleset rows (already sorted)
+
+	publishErr     error
+	publishCount   int
+	publishDigests []string
 
 	inserted []models.Submission
 	saves    int
@@ -252,13 +258,49 @@ func (f *fakeStore) ResetForRescan(ctx context.Context, id bson.ObjectID, expire
 	return true, nil
 }
 
-func (f *fakeStore) ListSubmissions(ctx context.Context, page, limit int) ([]models.Submission, int64, error) {
+func (f *fakeStore) RulesetState(ctx context.Context) (*models.RulesetState, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.listErr != nil {
-		return nil, 0, f.listErr
+	if f.stateErr != nil {
+		return nil, false, f.stateErr
 	}
-	return f.items, f.total, nil
+	if f.ruleState == nil {
+		return nil, false, nil
+	}
+	clone := *f.ruleState
+	return &clone, true, nil
+}
+
+func (f *fakeStore) RulesetEntries(ctx context.Context, cutoff time.Time) ([]models.RulesetEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.entriesErr != nil {
+		return nil, f.entriesErr
+	}
+	return f.entries, nil
+}
+
+func (f *fakeStore) PublishRulesetState(ctx context.Context, digest string, now time.Time) (*models.RulesetState, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.publishCount++
+	f.publishDigests = append(f.publishDigests, digest)
+	if f.publishErr != nil {
+		return nil, false, f.publishErr
+	}
+	if f.ruleState == nil {
+		f.ruleState = &models.RulesetState{ID: models.RulesetStateID, Version: 1, Digest: digest, UpdatedAt: now}
+		clone := *f.ruleState
+		return &clone, true, nil
+	}
+	bumped := f.ruleState.Digest != digest
+	if bumped {
+		f.ruleState.Version++
+		f.ruleState.Digest = digest
+		f.ruleState.UpdatedAt = now
+	}
+	clone := *f.ruleState
+	return &clone, bumped, nil
 }
 
 func (f *fakeStore) byID(id bson.ObjectID) *models.Submission {
@@ -375,16 +417,10 @@ func postJSON(t *testing.T, url, body string) *http.Response {
 }
 
 type envelope struct {
-	Success    bool            `json:"success"`
-	Message    string          `json:"message"`
-	Data       json.RawMessage `json:"data"`
-	Pagination *struct {
-		Page       int   `json:"page"`
-		Limit      int   `json:"limit"`
-		Total      int64 `json:"total"`
-		TotalPages int64 `json:"totalPages"`
-	} `json:"pagination"`
-	Error struct {
+	Success bool            `json:"success"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
+	Error   struct {
 		Code   string `json:"code"`
 		Status int    `json:"status"`
 	} `json:"error"`
@@ -405,6 +441,22 @@ type submissionDTO struct {
 	Verdict    *string          `json:"verdict"`
 	CreatedAt  string           `json:"createdAt"`
 	UpdatedAt  string           `json:"updatedAt"`
+	Rule       *dnrRuleDTO      `json:"rule,omitempty"`
+}
+
+// dnrRuleDTO mirrors a declarativeNetRequest rule as the responses deliver
+// it: the verbatim object a browser extension installs.
+type dnrRuleDTO struct {
+	ID       *int64 `json:"id"`
+	Priority int64  `json:"priority"`
+	Action   struct {
+		Type string `json:"type"`
+	} `json:"action"`
+	Condition struct {
+		URLFilter                string   `json:"urlFilter"`
+		ResourceTypes            []string `json:"resourceTypes"`
+		IsURLFilterCaseSensitive bool     `json:"isUrlFilterCaseSensitive"`
+	} `json:"condition"`
 }
 
 func assertJSONError(t *testing.T, resp *http.Response, wantStatus int, wantCode string) envelope {
@@ -479,6 +531,9 @@ func TestCheckURLSuccess(t *testing.T) {
 		if sub.Verdict == nil || *sub.Verdict != models.VerdictNoThreat {
 			t.Errorf("data.verdict = %v, want no_threat_detected", sub.Verdict)
 		}
+		if sub.Rule != nil {
+			t.Errorf("a verified-clean assessment carries no rule: %+v", sub.Rule)
+		}
 		if analyzer.calls != 1 {
 			t.Errorf("provider calls = %d", analyzer.calls)
 		}
@@ -525,6 +580,9 @@ func TestCheckURLSuccess(t *testing.T) {
 		if sub.Verdict != nil {
 			t.Errorf("data.verdict = %v; a pending scan has no verdict", sub.Verdict)
 		}
+		if sub.Rule != nil {
+			t.Errorf("a pending assessment carries no rule: %+v", sub.Rule)
+		}
 		if sub.ProviderID != "qs-1" {
 			t.Errorf("data.providerId = %q", sub.ProviderID)
 		}
@@ -570,10 +628,70 @@ func TestCheckURLSuccess(t *testing.T) {
 		if sub.Verdict == nil || *sub.Verdict != models.VerdictSuspicious {
 			t.Errorf("the stored verdict was not served: %v", sub.Verdict)
 		}
+		if sub.Rule == nil {
+			t.Error("a cached threat assessment carries its installable rule (data.rule)")
+		} else if sub.Rule.Condition.URLFilter != "||example.com^" || sub.Rule.Priority != 1 ||
+			sub.Rule.Action.Type != "block" {
+			t.Errorf("data.rule = %+v, want a block rule for ||example.com^", sub.Rule)
+		}
 		if sub.ProviderID != "qs-old" {
 			t.Errorf("data.providerId = %q", sub.ProviderID)
 		}
 	})
+
+	t.Run("a confirmed threat carries the installable rule with no id", func(t *testing.T) {
+		analyzer := &fakeAnalyzer{result: maliciousV2Result("qs-mal")}
+		store := &fakeStore{}
+		srv := newTestServer(t, analyzer, store)
+
+		resp := postJSON(t, srv.URL+"/api/v1/check-url", `{"url":"https://hostile.example/download"}`)
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("status = %d; body = %s", resp.StatusCode, body)
+		}
+		var en envelope
+		if err := json.Unmarshal(body, &en); err != nil {
+			t.Fatalf("not JSON: %s", body)
+		}
+		var sub submissionDTO
+		if err := json.Unmarshal(en.Data, &sub); err != nil {
+			t.Fatalf("data is not a submission: %s", en.Data)
+		}
+		if sub.Verdict == nil || *sub.Verdict != models.VerdictMalicious {
+			t.Fatalf("data.verdict = %v, want malicious; body %s", sub.Verdict, en.Data)
+		}
+		if sub.Rule == nil {
+			t.Fatalf("data.rule is missing for a confirmed malicious assessment: %s", en.Data)
+		}
+		if sub.Rule.ID != nil {
+			t.Errorf("data.rule.id = %v, want absent (the client assigns one dynamically)", *sub.Rule.ID)
+		}
+		if sub.Rule.Condition.URLFilter != "||hostile.example^/download|" ||
+			sub.Rule.Priority != 1 || sub.Rule.Action.Type != "block" ||
+			!sub.Rule.Condition.IsURLFilterCaseSensitive {
+			t.Errorf("data.rule = %+v, want a case-sensitive block for ||hostile.example^/download|", sub.Rule)
+		}
+		if len(sub.Rule.Condition.ResourceTypes) != len(models.DNRResourceTypes) {
+			t.Errorf("data.rule.condition.resourceTypes = %d entries, want all %d",
+				len(sub.Rule.Condition.ResourceTypes), len(models.DNRResourceTypes))
+		}
+	})
+}
+
+// maliciousV2Result is a finished provider result whose scanners classify
+// the URL as malicious — the verdict policy resolves any malicious scanner
+// evidence onto a malicious verdict.
+func maliciousV2Result(id string) hybridanalysis.Result {
+	return hybridanalysis.Result{
+		ID: id, SHA256: "abc", ScanType: "all", Finished: true,
+		ScannersV2: map[string]any{
+			"bfore_ai": map[string]any{"status": "malicious", "progress": 100},
+		},
+		Reports: []string{"r1"},
+	}
 }
 
 func TestCheckURLValidation(t *testing.T) {
@@ -719,65 +837,28 @@ func TestCheckURLMethodNotAllowed(t *testing.T) {
 	}
 }
 
-// ---- GET /api/v1/get-all ----
+// ---- GET /api/v1/get-all — version-aware ruleset sync ----
 
-func TestGetAll(t *testing.T) {
-	fixed := time.Date(2026, 10, 17, 10, 0, 0, 0, time.UTC)
-	items := []models.Submission{
-		{URL: "https://newest.example", Provider: models.ProviderName, ProviderID: "qs-3",
-			ScanType: "all", Status: models.StatusPending, CreatedAt: fixed, UpdatedAt: fixed},
-		{URL: "https://older.example", Provider: models.ProviderName, ProviderID: "qs-2",
-			ScanType: "all", Status: models.StatusCompleted, Finished: true, CreatedAt: fixed.Add(-time.Minute), UpdatedAt: fixed.Add(-time.Minute)},
+func TestGetAllRuleset(t *testing.T) {
+	entries := []models.RulesetEntry{
+		{URL: "https://a-threat.example", Verdict: models.VerdictMalicious},
+		{URL: "https://b-threat.example/download", Verdict: models.VerdictSuspicious},
 	}
 
-	t.Run("returns stored items with pagination", func(t *testing.T) {
-		srv := newTestServer(t, nil, &fakeStore{items: items, total: 2})
-
-		resp, err := http.Get(srv.URL + "/api/v1/get-all?page=1&limit=20")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer resp.Body.Close()
-
+	decode := func(t *testing.T, resp *http.Response, into any) string {
+		t.Helper()
 		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d; body = %s", resp.StatusCode, body)
-		}
-
-		var en envelope
-		if err := json.Unmarshal(body, &en); err != nil {
+		if err := json.Unmarshal(body, into); err != nil {
 			t.Fatalf("not JSON: %s", body)
 		}
-		if !en.Success || en.Pagination == nil {
-			t.Fatalf("envelope = %+v", en)
-		}
-		if en.Pagination.Total != 2 || en.Pagination.TotalPages != 1 || en.Pagination.Limit != 20 {
-			t.Errorf("pagination = %+v", en.Pagination)
-		}
+		return string(body)
+	}
 
-		var got []submissionDTO
-		if err := json.Unmarshal(en.Data, &got); err != nil {
-			t.Fatalf("data: %s", en.Data)
-		}
-		if len(got) != 2 {
-			t.Fatalf("items = %d", len(got))
-		}
-		if got[0].ID == "" {
-			t.Error("item id (the mongo document id) is required")
-		}
-		if got[0].URL != "https://newest.example" {
-			t.Errorf("first item url = %q", got[0].URL)
-		}
-		if got[0].Verdict != nil {
-			t.Error("verdict must be null, not invented")
-		}
-	})
-
-	t.Run("empty collection", func(t *testing.T) {
-		srv := newTestServer(t, nil, &fakeStore{items: []models.Submission{}})
+	t.Run("missing version is a first-time client and receives the complete ruleset", func(t *testing.T) {
+		srv := newTestServer(t, nil, &fakeStore{entries: entries})
 
 		resp, err := http.Get(srv.URL + "/api/v1/get-all")
 		if err != nil {
@@ -785,62 +866,205 @@ func TestGetAll(t *testing.T) {
 		}
 		defer resp.Body.Close()
 
-		body, _ := io.ReadAll(resp.Body)
+		var got []models.DNRRule
+		body := decode(t, resp, &got)
 		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("status = %d; %s", resp.StatusCode, body)
+			t.Fatalf("status %d body %s", resp.StatusCode, body)
 		}
-		if !strings.Contains(string(body), `"data":[]`) {
-			t.Errorf("empty collection must read as an empty array, not null: %s", body)
+		if trimmed := strings.TrimSpace(body); !strings.HasPrefix(trimmed, "[") {
+			t.Fatalf("the body is not a bare rules array: %s", body)
 		}
-		if !strings.Contains(string(body), `"totalPages":0`) {
-			t.Errorf("an empty collection has zero pages: %s", body)
+		if version := resp.Header.Get(hdrRulesetVersion); version != "1" {
+			t.Errorf("X-Ruleset-Version = %q, want 1", version)
+		}
+		if updated := resp.Header.Get(hdrRulesetUpdated); updated != "true" {
+			t.Errorf("X-Ruleset-Updated = %q, want true", updated)
+		}
+		if len(got) != 2 ||
+			got[0].ID == nil || *got[0].ID != 1 || got[1].ID == nil || *got[1].ID != 2 ||
+			got[0].Priority != 1 || got[1].Priority != 1 ||
+			got[0].Action.Type != "block" || got[1].Action.Type != "block" ||
+			got[0].Condition.URLFilter != "||a-threat.example^" ||
+			got[1].Condition.URLFilter != "||b-threat.example^/download|" ||
+			!got[0].Condition.IsURLFilterCaseSensitive ||
+			len(got[0].Condition.ResourceTypes) != len(models.DNRResourceTypes) {
+			t.Errorf("rules = %+v, want both threats as ids 1..2 with the documented conditions", got)
 		}
 	})
 
-	t.Run("store failure", func(t *testing.T) {
-		srv := newTestServer(t, nil, &fakeStore{listErr: errors.New("find: closed")})
+	t.Run("matching version returns [] without reading the collection", func(t *testing.T) {
+		store := &fakeStore{entries: entries}
+		srv := newTestServer(t, nil, store)
 
+		// Establish the published snapshot (first call).
+		if resp, err := http.Get(srv.URL + "/api/v1/get-all"); err != nil {
+			t.Fatal(err)
+		} else {
+			resp.Body.Close()
+		}
+
+		resp, err := http.Get(srv.URL + "/api/v1/get-all?version=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		var got []models.DNRRule
+		body := decode(t, resp, &got)
+		if resp.StatusCode != http.StatusOK || len(got) != 0 || strings.TrimSpace(body) != "[]" {
+			t.Fatalf("status = %d; body = %s", resp.StatusCode, body)
+		}
+		if version := resp.Header.Get(hdrRulesetVersion); version != "1" {
+			t.Errorf("X-Ruleset-Version = %q", version)
+		}
+		if updated := resp.Header.Get(hdrRulesetUpdated); updated != "false" {
+			t.Errorf("X-Ruleset-Updated = %q, want false", updated)
+		}
+
+		// Prove the match path never touches the URL collection: with the
+		// entries read broken it still answers exactly the same body.
+		store.mu.Lock()
+		store.entriesErr = errors.New("find: unready")
+		store.mu.Unlock()
+		resp2, err := http.Get(srv.URL + "/api/v1/get-all?version=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp2.Body.Close()
+		var got2 []models.DNRRule
+		decode(t, resp2, &got2)
+		if resp2.StatusCode != http.StatusOK || len(got2) != 0 ||
+			resp2.Header.Get(hdrRulesetUpdated) != "false" {
+			t.Errorf("matched path read the collection or changed shape: %s", body)
+		}
+		store.mu.Lock()
+		store.entriesErr = nil
+		store.mu.Unlock()
+	})
+
+	t.Run("different version returns the full current snapshot", func(t *testing.T) {
+		srv := newTestServer(t, nil, &fakeStore{entries: entries})
+
+		resp, err := http.Get(srv.URL + "/api/v1/get-all?version=0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		var got []models.DNRRule
+		body := decode(t, resp, &got)
+		if resp.StatusCode != http.StatusOK || len(got) != 2 {
+			t.Fatalf("status = %d; body %s", resp.StatusCode, body)
+		}
+		if updated := resp.Header.Get(hdrRulesetUpdated); updated != "true" {
+			t.Errorf("X-Ruleset-Updated = %q, want true", updated)
+		}
+	})
+
+	t.Run("an empty published ruleset is still a valid response", func(t *testing.T) {
+		srv := newTestServer(t, nil, &fakeStore{entries: []models.RulesetEntry{}})
+
+		resp, err := http.Get(srv.URL + "/api/v1/get-all")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+
+		var got []models.DNRRule
+		body := decode(t, resp, &got)
+		if resp.StatusCode != http.StatusOK || len(got) != 0 || strings.TrimSpace(body) != "[]" ||
+			resp.Header.Get(hdrRulesetVersion) != "1" || resp.Header.Get(hdrRulesetUpdated) != "true" {
+			t.Errorf("empty ruleset first read = %s (headers %q %q)", body,
+				resp.Header.Get(hdrRulesetVersion), resp.Header.Get(hdrRulesetUpdated))
+		}
+
+		resp2, err := http.Get(srv.URL + "/api/v1/get-all?version=1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp2.Body.Close()
+		var got2 []models.DNRRule
+		decode(t, resp2, &got2)
+		if len(got2) != 0 || resp2.Header.Get(hdrRulesetUpdated) != "false" {
+			t.Errorf("empty ruleset match = body %s", body)
+		}
+	})
+
+	t.Run("store failures are honest errors", func(t *testing.T) {
+		srv := newTestServer(t, nil, &fakeStore{entriesErr: errors.New("find: closed")})
 		resp, err := http.Get(srv.URL + "/api/v1/get-all")
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer resp.Body.Close()
 		assertJSONError(t, resp, http.StatusServiceUnavailable, services.CodeStoreUnavailable)
+		if version := resp.Header.Get(hdrRulesetVersion); version != "" {
+			t.Errorf("an error response carries no ruleset headers, got %q", version)
+		}
 	})
 
 	t.Run("method not allowed", func(t *testing.T) {
 		srv := newTestServer(t, nil, &fakeStore{})
-
 		resp := postJSON(t, srv.URL+"/api/v1/get-all", `{}`)
 		en := assertJSONError(t, resp, http.StatusMethodNotAllowed, "method_not_allowed")
 		_ = en
+		if allow := resp.Header.Get("Allow"); allow != "GET" {
+			t.Errorf("Allow = %q, want GET", allow)
+		}
 	})
 }
 
-func TestGetAllPaginationValidation(t *testing.T) {
+func TestGetAllVersionValidation(t *testing.T) {
 	cases := []struct {
 		query string
-		code  string
+		note  string
 	}{
-		{"?page=abc", services.CodeInvalidRequest},
-		{"?limit=abc", services.CodeInvalidRequest},
-		{"?page=0", services.CodeInvalidRequest},
-		{"?limit=0", services.CodeInvalidRequest},
-		{"?limit=101", services.CodeInvalidRequest},
-		{"?page=-1", services.CodeInvalidRequest},
+		{"?version=abc", "not an integer"},
+		{"?version=", "present but empty"},
+		{"?version=-1", "negative"},
+		{"?version=+3", "signed"},
+		{"?version=3.5", "fractional"},
+		{"?version=01", "leading zero"},
+		{"?version=+000", "signed zeros"},
+		// A raw space never reaches the handler (the HTTP server rejects
+		// the malformed request-target before routing), so clients that
+		// send whitespace arrive percent-encoded — which is still invalid.
+		{"?version=%203", "percent-encoded whitespace"},
+		{"?version=%2B3", "percent-encoded plus sign"},
+		{"?version=٣", "non-ASCII digit"},
+		{"?version=9999999999999999999", "19 digits does not fit an int64"},
+		{"?version=3&version=4", "requested twice"},
 	}
 	for _, tc := range cases {
-		t.Run(tc.query, func(t *testing.T) {
-			srv := newTestServer(t, nil, &fakeStore{items: []models.Submission{}})
+		t.Run(tc.note, func(t *testing.T) {
+			srv := newTestServer(t, nil, &fakeStore{})
 
 			resp, err := http.Get(srv.URL + "/api/v1/get-all" + tc.query)
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer resp.Body.Close()
-			assertJSONError(t, resp, http.StatusBadRequest, tc.code)
+			en := assertJSONError(t, resp, http.StatusBadRequest, services.CodeInvalidRequest)
+			if !strings.Contains(en.Message, "version") {
+				t.Errorf("message %q does not name the parameter", en.Message)
+			}
 		})
 	}
+
+	t.Run("well-formed versions are accepted", func(t *testing.T) {
+		srv := newTestServer(t, nil, &fakeStore{entries: []models.RulesetEntry{}})
+		for _, query := range []string{"?version=0", "?version=" + strings.Repeat("9", 18)} {
+			resp, err := http.Get(srv.URL + "/api/v1/get-all" + query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer resp.Body.Close()
+			body, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf("%s status = %d; %s", query, resp.StatusCode, body)
+			}
+		}
+	})
 }
 
 // ---- routing, CORS, health, docs ----
@@ -1001,17 +1225,28 @@ func TestOpenAPISpec(t *testing.T) {
 		}
 	}
 	// Both the completed (200) and the still-running (202) answers are
-	// documented, as is the verdict vocabulary and the pending/completed
-	// status distinction.
+	// documented, as are the verdict vocabulary, the pending/completed
+	// status distinction and the verbatim declarativeNetRequest ruleset
+	// contract (bare rules array + synchronization headers, no pagination,
+	// no success envelope on get-all).
 	for _, want := range []string{
 		"200", "202", "422", "429", "502", "503", "504",
-		"totalPages", "pagination",
+		"X-Ruleset-Version", "X-Ruleset-Updated", "DNRRule", "urlFilter",
+		"updateDynamicRules", "main_frame", "block",
 		"pending", "completed",
 		"no_threat_detected", "inconclusive", "unknown",
 		"GET /quick-scan/{id}",
 	} {
 		if !strings.Contains(spec, want) {
 			t.Errorf("the contract does not describe %q", want)
+		}
+	}
+	// Pagination is gone from the contract, and with it the success
+	// envelope that once wrapped the ruleset: both the parameter names
+	// and the response markers must be absent.
+	for _, gone := range []string{"totalPages", "pagination", "?page=", "limit:", "RulesetResponse", "RuleEntry", "Ruleset is up to date"} {
+		if strings.Contains(spec, gone) {
+			t.Errorf("the contract still documents a removed contract element %q", gone)
 		}
 	}
 	// No credential of any kind may appear. The environment variable NAME is
@@ -1074,7 +1309,7 @@ func TestSwaggerUI(t *testing.T) {
 }
 
 func TestXRequestIDPropagation(t *testing.T) {
-	srv := newTestServer(t, nil, &fakeStore{items: []models.Submission{}})
+	srv := newTestServer(t, nil, &fakeStore{})
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/get-all", nil)
 	req.Header.Set("X-Request-ID", "website-correlation-id-42")

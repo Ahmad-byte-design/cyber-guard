@@ -1,12 +1,12 @@
 // Package models defines the shapes that cross the API boundary and are
-// persisted in MongoDB: the submission document and the pagination metadata.
+// persisted in MongoDB: the submission document, the published ruleset
+// snapshot and its version state.
 //
 // Provider-specific field names stop in the hybridanalysis package. Everything
 // an API client or the database sees is named here, once.
 package models
 
 import (
-	"math"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
@@ -117,6 +117,13 @@ type Submission struct {
 	// CreatedAt and UpdatedAt are always UTC.
 	CreatedAt time.Time `bson:"createdAt" json:"createdAt"`
 	UpdatedAt time.Time `bson:"updatedAt" json:"updatedAt"`
+
+	// Rule is the declarativeNetRequest rule a browser extension can
+	// install for this URL immediately, derived from the stored URL and
+	// verdict with the same mapping as the published ruleset. It is set
+	// only on API responses for assessments carrying a published verdict
+	// (malicious or suspicious), and it is never persisted.
+	Rule *DNRRule `bson:"-" json:"rule,omitempty"`
 }
 
 // IsCompleted reports whether the record holds a provider-confirmed finished
@@ -157,20 +164,101 @@ type AntiVirusResult struct {
 	ThreatFound string `json:"threatFound" bson:"threatFound"`
 }
 
-// Pagination is the metadata returned with every list response.
-type Pagination struct {
-	Page       int   `json:"page"`
-	Limit      int   `json:"limit"`
-	Total      int64 `json:"total"`
-	TotalPages int64 `json:"totalPages"`
+// RulesetEntry is the service-level publishing unit: one canonical URL and
+// its actual published verdict, nothing else from the submission document
+// crosses this boundary. Handlers map entries onto the extension-facing
+// rules ( models.DNRRule ) when they serve the ruleset.
+type RulesetEntry struct {
+	// URL is the canonicalized URL, identical to the stored record's.
+	URL string `bson:"url" json:"url"`
+	// Verdict is the record's stored verdict (malicious or suspicious; see
+	// PublishedVerdicts). It is copied, never derived at read time.
+	Verdict string `bson:"verdict" json:"verdict"`
 }
 
-// NewPagination computes total pages for a page of size limit over total
-// items. A total of zero yields zero pages, not one.
-func NewPagination(page, limit int, total int64) Pagination {
-	totalPages := int64(0)
-	if limit > 0 && total > 0 {
-		totalPages = int64(math.Ceil(float64(total) / float64(limit)))
-	}
-	return Pagination{Page: page, Limit: limit, Total: total, TotalPages: totalPages}
+// PublishedVerdicts is the eligibility vocabulary of the published ruleset: a
+// stored record becomes a rule only when its verdict is in this list.
+//
+// The policy deliberately excludes the other verdicts:
+//
+//   - no_threat_detected is evidence that a URL is clean, not a rule to warn
+//     about;
+//   - inconclusive and unknown scanner evidence is never read as a threat
+//     classification;
+//   - records without any verdict (pending, failed, deprecated "submitted")
+//     have no confirmed classification at all.
+var PublishedVerdicts = []string{VerdictMalicious, VerdictSuspicious}
+
+// DNRResourceTypes is the request-type list every published rule covers: a
+// fixed, extension-agnostic set — a published verdict is evidence about a
+// URL, not about which request type carried it.
+var DNRResourceTypes = []string{
+	"main_frame",
+	"sub_frame",
+	"script",
+	"xmlhttprequest",
+	"ping",
+	"websocket",
+	"webtransport",
+}
+
+// DNRAction is the action part of a published rule. Both published verdicts
+// map onto the single "block" action: the ruleset exists to keep
+// classified-threat URLs away, and every rule says exactly that.
+type DNRAction struct {
+	// Type is "block".
+	Type string `json:"type"`
+}
+
+// DNRCondition is the condition part of a published rule: an adblock-style
+// urlFilter plus the constant request types of DNRResourceTypes.
+type DNRCondition struct {
+	// URLFilter matches the assessed URL, built as ||host^path| (a bare
+	// host becomes ||host^). See the get-all contract for the exact
+	// construction.
+	URLFilter string `json:"urlFilter"`
+	// ResourceTypes is DNRResourceTypes, always the same list.
+	ResourceTypes []string `json:"resourceTypes"`
+	// IsURLFilterCaseSensitive is always true; the pattern is delivered
+	// verbatim as stored.
+	IsURLFilterCaseSensitive bool `json:"isUrlFilterCaseSensitive"`
+}
+
+// DNRRule is one dynamic declarativeNetRequest rule, in the exact shape a
+// browser extension installs through updateDynamicRules — the ruleset is
+// delivered verbatim for that purpose.
+type DNRRule struct {
+	// ID is the rule's identifier, 1..N over the published order. A rule
+	// derived for a single URL (the check-url response's data.rule) has
+	// no id: the client assigns one when adding it dynamically. The zero
+	// value is omitted, so an extension cannot install an id-less rule by
+	// accident.
+	ID *int64 `json:"id,omitempty"`
+	// Priority is 1 for every published rule.
+	Priority int64 `json:"priority"`
+	// Action is always "block".
+	Action DNRAction `json:"action"`
+	// Condition carries the URL match.
+	Condition DNRCondition `json:"condition"`
+}
+
+// RulesetCollection holds the authoritative published version document.
+const RulesetCollection = "ruleset_state"
+
+// RulesetStateID pins the single version document. Upserts against this exact
+// ID mean concurrent runs can never create a duplicate version document.
+const RulesetStateID = "current"
+
+// RulesetState is the stored version document. It is internal state: the
+// version is served inside the get-all response, the digest and timestamps
+// never leave the process.
+//
+// The digest is the SHA-256 fingerprint of the published entries as they were
+// when the version was written. A read that cannot reproduce it refuses to
+// serve instead of returning version and data from different snapshots.
+type RulesetState struct {
+	ID        string    `bson:"_id" json:"-"`
+	Version   int64     `bson:"version" json:"-"`
+	Digest    string    `bson:"digest" json:"-"`
+	UpdatedAt time.Time `bson:"updatedAt" json:"-"`
 }
